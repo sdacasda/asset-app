@@ -34,7 +34,7 @@ from pydantic import BaseModel
 
 DB_PATH = os.getenv("DB_PATH", "asset_management.db")
 APP_NAME = os.getenv("APP_NAME", "资产智能管控台")
-APP_VERSION = os.getenv("APP_VERSION", "v23")
+APP_VERSION = os.getenv("APP_VERSION", "v24")
 APP_BUILD_TIME = os.getenv("APP_BUILD_TIME", "2026-06-22")
 SESSION_COOKIE_NAME = "asset_session"
 SESSION_DAYS = int(os.getenv("SESSION_DAYS", "7"))
@@ -165,6 +165,20 @@ def remember_source_url_alias(conn: sqlite3.Connection, source_url: str, source_
     conn.execute(
         "INSERT OR IGNORE INTO source_url_aliases(source_url, source_group, created_at) VALUES(?, ?, ?)",
         (url, group, now_text()),
+    )
+
+
+def record_source_url_history(conn: sqlite3.Connection, source_id: int, source_name: str, old_url: str, new_url: str, changed_by: str = "", reason: str = "") -> None:
+    old_norm = normalize_source_url_for_alias(old_url)
+    new_norm = normalize_source_url_for_alias(new_url)
+    if not old_norm or not new_norm or old_norm == new_norm:
+        return
+    conn.execute(
+        """
+        INSERT INTO source_url_history(source_id, source_name, old_url, new_url, reason, changed_by, created_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?)
+        """,
+        (int(source_id), source_name or "", old_norm, new_norm, reason or "", changed_by or "", now_text()),
     )
 
 
@@ -464,6 +478,19 @@ def init_db() -> None:
     ensure_column(conn, "asset_records", "deleted_at", "TEXT")
     ensure_column(conn, "asset_records", "deleted_by", "TEXT")
     ensure_column(conn, "asset_records", "delete_reason", "TEXT")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS source_url_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_id INTEGER NOT NULL,
+            source_name TEXT,
+            old_url TEXT NOT NULL,
+            new_url TEXT NOT NULL,
+            reason TEXT,
+            changed_by TEXT,
+            created_at TEXT NOT NULL
+        )
+    """)
 
     cur.execute("""
         CREATE TABLE IF NOT EXISTS app_meta (
@@ -1214,6 +1241,14 @@ class SourceConfigPayload(BaseModel):
     schedule_interval_minutes: int = 0
     enabled: bool = True
     sort_order: int = 0
+
+
+class SourceAliasPayload(BaseModel):
+    source_url: str
+
+
+class UrlRollbackPayload(BaseModel):
+    history_id: int
 
 
 class BulkDeleteRequest(BaseModel):
@@ -2376,6 +2411,8 @@ def update_source(source_id: int, payload: SourceConfigPayload, user: Dict[str, 
     try:
         if old_source:
             remember_source_url_alias(conn, old_source["source_url"], old_source["name"])
+            if normalize_source_url_for_alias(old_source["source_url"]) != normalize_source_url_for_alias(source_url):
+                record_source_url_history(conn, source_id, old_source["name"], old_source["source_url"], source_url, str(user.get("username", "")), "编辑数据源网址")
         cur = conn.execute("""
             UPDATE source_configs
             SET name=?,
@@ -2478,6 +2515,93 @@ def test_source(source_id: int, user: Dict[str, object] = Depends(require_user))
         add_log(f"数据源测试异常：{row['name']}，{msg}", "error")
         return {"success": False, "message": msg}
 
+
+
+@app.get("/api/sources/{source_id}/url_history")
+def get_source_url_history(source_id: int, user: Dict[str, object] = Depends(require_user)):
+    conn = get_conn()
+    source = conn.execute("SELECT id, name FROM source_configs WHERE id=?", (source_id,)).fetchone()
+    if not source:
+        conn.close()
+        return JSONResponse({"success": False, "message": "数据源不存在"}, status_code=404)
+    rows = conn.execute(
+        """
+        SELECT id, source_id, source_name, old_url, new_url, reason, changed_by, created_at
+        FROM source_url_history
+        WHERE source_id=?
+        ORDER BY id DESC
+        LIMIT 50
+        """,
+        (source_id,),
+    ).fetchall()
+    aliases = conn.execute(
+        """
+        SELECT id, source_url, source_group, created_at
+        FROM source_url_aliases
+        WHERE source_group=?
+        ORDER BY id DESC
+        LIMIT 100
+        """,
+        (source_group_from_name(source["name"]),),
+    ).fetchall()
+    conn.close()
+    return {"success": True, "data": [dict(r) for r in rows], "aliases": [dict(r) for r in aliases]}
+
+
+@app.post("/api/sources/{source_id}/aliases")
+def add_source_url_alias_api(source_id: int, payload: SourceAliasPayload, user: Dict[str, object] = Depends(require_user)):
+    conn = get_conn()
+    source = conn.execute("SELECT id, name FROM source_configs WHERE id=?", (source_id,)).fetchone()
+    if not source:
+        conn.close()
+        return JSONResponse({"success": False, "message": "数据源不存在"}, status_code=404)
+    try:
+        alias_url = validate_target_url(payload.source_url)
+        remember_source_url_alias(conn, alias_url, source["name"])
+        before = conn.execute("SELECT COUNT(1) AS c FROM asset_records WHERE source_id IS NULL AND deleted_at IS NULL").fetchone()["c"]
+        repair_asset_source_bindings(conn)
+        after = conn.execute("SELECT COUNT(1) AS c FROM asset_records WHERE source_id IS NULL AND deleted_at IS NULL").fetchone()["c"]
+        conn.commit()
+        conn.close()
+        fixed = max(0, before - after)
+        add_log(f"旧网址别名已绑定：{source['name']} <- {alias_url}，修复 {fixed} 条", "info")
+        return {"success": True, "message": f"旧网址别名已绑定，并修复历史分类 {fixed} 条。"}
+    except Exception as exc:
+        conn.close()
+        return JSONResponse({"success": False, "message": str(exc)}, status_code=400)
+
+
+@app.post("/api/sources/{source_id}/rollback_url")
+def rollback_source_url(source_id: int, payload: UrlRollbackPayload, user: Dict[str, object] = Depends(require_user)):
+    conn = get_conn()
+    source = conn.execute("SELECT id, name, source_url FROM source_configs WHERE id=?", (source_id,)).fetchone()
+    hist = conn.execute("SELECT * FROM source_url_history WHERE id=? AND source_id=?", (payload.history_id, source_id)).fetchone()
+    if not source or not hist:
+        conn.close()
+        return JSONResponse({"success": False, "message": "记录不存在"}, status_code=404)
+    old_current = source["source_url"]
+    target_url = hist["old_url"]
+    remember_source_url_alias(conn, old_current, source["name"])
+    record_source_url_history(conn, source_id, source["name"], old_current, target_url, str(user.get("username", "")), "从网址变更记录回滚")
+    conn.execute("UPDATE source_configs SET source_url=?, updated_at=? WHERE id=?", (target_url, now_text(), source_id))
+    repair_asset_source_bindings(conn)
+    conn.commit()
+    conn.close()
+    add_log(f"数据源网址已回滚：{source['name']}，{old_current} -> {target_url}", "warn")
+    return {"success": True, "message": "网址已回滚，旧网址已保留为别名，历史分类已重新修复。"}
+
+
+@app.post("/api/maintenance/repair_source_bindings")
+def repair_source_bindings_api(user: Dict[str, object] = Depends(require_user)):
+    conn = get_conn()
+    before = conn.execute("SELECT COUNT(1) AS c FROM asset_records WHERE source_id IS NULL AND deleted_at IS NULL").fetchone()["c"]
+    repair_asset_source_bindings(conn)
+    after = conn.execute("SELECT COUNT(1) AS c FROM asset_records WHERE source_id IS NULL AND deleted_at IS NULL").fetchone()["c"]
+    conn.commit()
+    conn.close()
+    fixed = max(0, before - after)
+    add_log(f"已执行历史分类修复：修复 {fixed} 条，剩余未归类 {after} 条", "info")
+    return {"success": True, "message": f"已修复 {fixed} 条，剩余未归类 {after} 条。"}
 
 
 @app.post("/api/sync_tasks")
@@ -3069,6 +3193,10 @@ button{width:100%;height:48px;margin-top:22px;border:0;border-radius:10px;backgr
 .js-error-banner{display:none;position:fixed;left:12px;right:12px;bottom:12px;z-index:9999;background:#fff1f0;border:1px solid #ffccc7;color:#a8071a;padding:10px 12px;border-radius:12px;font-size:13px;box-shadow:0 8px 30px rgba(15,23,42,.16)}
 .js-error-banner.show{display:block}
 .sync-diff-line{margin-top:6px;color:#475467;font-weight:700}
+/* v24 URL management + mobile comfort polish */
+.url-history-box{margin-top:12px;border:1px dashed #d0d5dd;border-radius:12px;padding:12px;background:#fbfdff}
+.url-history-list{display:grid;gap:8px;margin-top:8px}.url-history-item{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:center;border:1px solid #eef2f7;border-radius:10px;background:#fff;padding:9px}.url-history-item code{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:12px;color:#475467}.url-history-item .hint{font-size:12px;color:#667085;margin-top:4px}.url-alias-row{display:flex;gap:8px;margin-top:8px}.url-alias-row input{flex:1}.back-to-top{display:none;position:fixed;right:14px;bottom:78px;z-index:30;border:0;border-radius:999px;background:#1677ff;color:#fff;width:42px;height:42px;font-size:18px;font-weight:900;box-shadow:0 10px 24px rgba(22,119,255,.28)}
+@media(max-width:640px){#sourceSummary{position:sticky;top:48px;z-index:3;box-shadow:0 6px 16px rgba(15,23,42,.06)}#addressList .record{margin-bottom:8px!important;border:1px solid #e9eef6!important;background:#fff!important}#addressList .record-head{grid-template-columns:minmax(0,1fr) auto auto!important;gap:7px!important}#addressList .addr{font-size:15px!important;line-height:1.42!important;-webkit-line-clamp:3!important;word-break:break-word!important;overflow-wrap:anywhere!important}#addressList .copy-btn{height:32px!important;min-width:56px!important;padding:0 10px!important;align-self:start!important}#addressList .badge{height:30px!important;align-self:start!important}.record .mobile-meta{display:none!important}.back-to-top.show{display:grid;place-items:center}}
 </style>
 </head>
 <body>
@@ -3863,6 +3991,15 @@ input,select,textarea,button{max-width:100%;min-width:0}
 </div>
 </div>
 </details>
+
+<details class="clean url-history-box" id="urlHistoryDetails" style="margin-top:12px">
+<summary>网址变更 / 旧网址归属管理</summary>
+<div style="height:10px"></div>
+<div class="notice">用于处理网址换新或误改：旧网址会作为别名保留，历史资产仍归到当前标头标签下。回滚不会删除资产。</div>
+<div class="url-alias-row"><input id="aliasUrlInput" placeholder="粘贴旧网址，例如 https://boxin888.cc/"><button class="btn" onclick="addUrlAlias()">绑定旧网址</button></div>
+<div style="height:8px"></div><button class="btn" onclick="repairSourceBindings()">修复历史分类归属</button>
+<div id="urlHistoryList" class="url-history-list"></div>
+</details>
 </div>
 </div>
 </section>
@@ -3922,6 +4059,7 @@ input,select,textarea,button{max-width:100%;min-width:0}
 </main>
 </div>
 
+<button id="backToTopBtn" class="back-to-top" onclick="window.scrollTo({top:0,behavior:'smooth'})">↑</button>
 <div id="jsErrorBanner" class="js-error-banner"></div>
 <script>
 window.addEventListener("error", function(e){try{var b=document.getElementById("jsErrorBanner"); if(b){b.textContent="页面脚本异常："+(e.message||"未知错误")+"。请刷新或回滚到稳定版。"; b.classList.add("show");}}catch(_){}});
@@ -3954,6 +4092,7 @@ window.onload = () => {
     loadBackups();
     setInterval(fetchLogs, 5000);
     setInterval(fetchSyncRuns, 10000);
+    window.addEventListener("scroll", () => { const b = $("backToTopBtn"); if (b) b.classList.toggle("show", window.scrollY > 450 && window.matchMedia("(max-width: 640px)").matches); }, {passive:true});
 };
 
 function updateClock() {
@@ -4089,6 +4228,7 @@ function selectedSource() {
 
 function onSourceChange() {
     fillSourceForm(selectedSource());
+    loadUrlHistory();
 }
 
 function onQuickSourceChange() {
@@ -4100,6 +4240,7 @@ function onQuickSourceChange() {
 function newSource() {
     $("sourceSelect").value = "";
     fillSourceForm(null);
+    renderUrlHistory(null);
     msg("已切换到新建数据源模式。", "");
 }
 
@@ -4187,6 +4328,7 @@ async function loadSources() {
             item.onclick = () => {
                 $("sourceSelect").value = String(s.id);
                 fillSourceForm(s);
+                loadUrlHistory();
             };
             list.appendChild(item);
         });
@@ -4194,6 +4336,9 @@ async function loadSources() {
         if (sources.some(s => String(s.id) === old)) {
             $("sourceSelect").value = old;
             fillSourceForm(selectedSource());
+            loadUrlHistory();
+        } else {
+            renderUrlHistory(null);
         }
 
         if (sources.some(s => String(s.id) === oldQuick)) {
@@ -4227,6 +4372,42 @@ function visibleSafeAddresses() {
     return filteredData().filter(x => cls(x.status_timer, x.status_type) === "safe").map(x => String(x.content_text || "").trim()).filter(Boolean);
 }
 
+function renderUrlHistory(payload) {
+    const box = $("urlHistoryList");
+    if (!box) return;
+    if (!payload) { box.innerHTML = '<div class="notice">请选择一个已保存的数据源后查看。</div>'; return; }
+    const rows = Array.isArray(payload.data) ? payload.data : [];
+    const aliases = Array.isArray(payload.aliases) ? payload.aliases : [];
+    const aliasHtml = aliases.length ? `<div class="notice">已绑定旧网址：${aliases.map(a => escapeHtml(a.source_url)).join("；")}</div>` : '<div class="notice">暂无旧网址别名。换网址或手动绑定后会显示在这里。</div>';
+    const historyHtml = rows.length ? rows.map(r => `<div class="url-history-item"><div><code>旧：${escapeHtml(r.old_url || "-")}</code><code>新：${escapeHtml(r.new_url || "-")}</code><div class="hint">${escapeHtml(r.created_at || "-")} · ${escapeHtml(r.reason || "网址变更")}</div></div><button class="btn" onclick="rollbackUrl(${Number(r.id)})">回滚</button></div>`).join("") : '<div class="notice">暂无网址变更记录。以后修改网址会自动记录。</div>';
+    box.innerHTML = aliasHtml + historyHtml;
+}
+async function loadUrlHistory() {
+    const id = $("sourceSelect") ? $("sourceSelect").value : "";
+    if (!id) { renderUrlHistory(null); return; }
+    const r = await apiFetch(`/api/sources/${id}/url_history`); if (!r) return;
+    const j = await r.json(); renderUrlHistory(j.success ? j : null);
+}
+async function addUrlAlias() {
+    const id = $("sourceSelect").value; const input = $("aliasUrlInput"); const value = input ? input.value.trim() : "";
+    if (!id) { msg("请先选择数据源。", "warn"); return; } if (!value) { msg("请填写旧网址。", "warn"); return; }
+    if (!confirm("确认把这个旧网址绑定到当前数据源标头下？\n这会尝试把历史未知分类重新归属到当前标头。")) return;
+    const r = await apiFetch(`/api/sources/${id}/aliases`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({source_url:value})}); if (!r) return;
+    const j = await r.json(); msg(j.message || "旧网址已绑定", j.success ? "ok" : "bad"); if (j.success && input) input.value = "";
+    await loadUrlHistory(); await fetchRecords();
+}
+async function rollbackUrl(historyId) {
+    const id = $("sourceSelect").value; if (!id || !historyId) return;
+    if (!confirm("确认回滚到这条记录的旧网址？\n当前网址会作为别名保留，历史资产不会删除。")) return;
+    const r = await apiFetch(`/api/sources/${id}/rollback_url`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({history_id:historyId})}); if (!r) return;
+    const j = await r.json(); msg(j.message || "网址已回滚", j.success ? "ok" : "bad");
+    await loadSources(); $("sourceSelect").value = String(id); fillSourceForm(selectedSource()); await loadUrlHistory(); await fetchRecords();
+}
+async function repairSourceBindings() {
+    if (!confirm("确认按当前数据源和旧网址别名修复历史分类归属？\n该操作不会删除资产。")) return;
+    const r = await apiFetch("/api/maintenance/repair_source_bindings", {method:"POST"}); if (!r) return;
+    const j = await r.json(); msg(j.message || "修复完成", j.success ? "ok" : "bad"); await fetchRecords();
+}
 async function copyVisibleSafeAddresses() {
     const rows = visibleSafeAddresses();
     if (!rows.length) { msg("当前筛选下没有纯净地址。", "warn"); return; }
@@ -4264,6 +4445,7 @@ async function saveSource() {
         msg(j.message || "数据源操作完成", j.success ? "ok" : "bad");
         await loadSources();
         if (j.id) $("sourceSelect").value = String(j.id);
+        await loadUrlHistory();
         fetchStats();
         fetchLogs();
     } catch (e) {

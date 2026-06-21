@@ -47,6 +47,12 @@ ALLOW_PRIVATE_SOURCE = os.getenv("ALLOW_PRIVATE_SOURCE", "false").lower() in ("1
 ALLOWED_SOURCE_HOSTS = [x.strip().lower() for x in os.getenv("ALLOWED_SOURCE_HOSTS", "").split(",") if x.strip()]
 BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "export_backups"))
 MAX_BACKUP_UPLOAD_BYTES = int(os.getenv("MAX_BACKUP_UPLOAD_MB", "50")) * 1024 * 1024
+AUTO_BACKUP_ENABLED = os.getenv("AUTO_BACKUP_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+AUTO_BACKUP_INTERVAL_HOURS = int(os.getenv("AUTO_BACKUP_INTERVAL_HOURS", "24"))
+AUTO_BACKUP_RETENTION_COUNT = int(os.getenv("AUTO_BACKUP_RETENTION_COUNT", "7"))
+SYNC_RETRY_ENABLED = os.getenv("SYNC_RETRY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+SYNC_RETRY_MAX_ATTEMPTS = int(os.getenv("SYNC_RETRY_MAX_ATTEMPTS", "3"))
+SYNC_RETRY_DELAY_SECONDS = int(os.getenv("SYNC_RETRY_DELAY_SECONDS", "300"))
 
 LOGIN_LOCK = threading.Lock()
 LOGIN_ATTEMPTS: Dict[str, List[float]] = {}
@@ -221,6 +227,18 @@ def init_db() -> None:
     ensure_column(conn, "source_configs", "created_at", "TEXT")
     ensure_column(conn, "source_configs", "updated_at", "TEXT")
     ensure_column(conn, "sync_runs", "source_id", "INTEGER")
+    ensure_column(conn, "sync_runs", "attempt", "INTEGER NOT NULL DEFAULT 1")
+    ensure_column(conn, "sync_runs", "scheduled", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "asset_records", "deleted_at", "TEXT")
+    ensure_column(conn, "asset_records", "deleted_by", "TEXT")
+    ensure_column(conn, "asset_records", "delete_reason", "TEXT")
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
 
     # 让资产记录优先绑定到数据源 ID。这样以后数据源网址变更，历史资产仍按“标题/标签”归类。
     # 同一个网址可能对应多个标题/关键词，所以迁移时优先匹配 source_url + keyword。
@@ -244,6 +262,7 @@ def init_db() -> None:
     """)
 
     cur.execute("CREATE INDEX IF NOT EXISTS idx_asset_source_id ON asset_records(source_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_asset_deleted_at ON asset_records(deleted_at)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_asset_source_keyword ON asset_records(source_url, keyword)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_asset_last_checked ON asset_records(last_checked)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_asset_status ON asset_records(status_timer)")
@@ -735,14 +754,14 @@ def parse_by_source(source_url: str, html_text: str) -> List[Dict[str, str]]:
     return parse_text_fallback(html_text)
 
 
-def create_sync_run(source_url: str, keyword: str, request_cookie: str, source_id: Optional[int] = None) -> int:
+def create_sync_run(source_url: str, keyword: str, request_cookie: str, source_id: Optional[int] = None, attempt: int = 1, scheduled: bool = False) -> int:
     conn = get_conn()
     cur = conn.execute(
         """
-        INSERT INTO sync_runs(source_id, source_url, keyword, used_proxy, used_cookie, status, started_at)
-        VALUES(?, ?, ?, 0, ?, ?, ?)
+        INSERT INTO sync_runs(source_id, source_url, keyword, used_proxy, used_cookie, status, started_at, attempt, scheduled)
+        VALUES(?, ?, ?, 0, ?, ?, ?, ?, ?)
         """,
-        (source_id, source_url, keyword, 1 if request_cookie else 0, "running", now_text()),
+        (source_id, source_url, keyword, 1 if request_cookie else 0, "running", now_text(), int(attempt or 1), 1 if scheduled else 0),
     )
     conn.commit()
     run_id = int(cur.lastrowid)
@@ -809,6 +828,7 @@ class ScrapeRequest(BaseModel):
     keyword: str
     request_cookie: str = ""
     source_id: Optional[int] = None
+    attempt: int = 1
 
 
 class SourceConfigPayload(BaseModel):
@@ -1103,9 +1123,39 @@ def write_sync_results(task_id: str, run_id: int, payload: ScrapeRequest, new_da
         "restored_from_available": restored_from_available,
     }
 
+
+def schedule_retry_task(original_task_id: str, payload: ScrapeRequest, reason: str, scheduled: bool) -> None:
+    if not (scheduled and SYNC_RETRY_ENABLED):
+        return
+    attempt = int(getattr(payload, "attempt", 1) or 1)
+    if attempt >= SYNC_RETRY_MAX_ATTEMPTS:
+        add_log(f"定时同步重试已达上限：task={original_task_id}，attempt={attempt}，原因={reason}", "error")
+        return
+
+    def delayed_retry() -> None:
+        try:
+            time.sleep(max(5, SYNC_RETRY_DELAY_SECONDS))
+            if has_running_task_for_source(payload.target_url, payload.keyword):
+                add_log(f"跳过重试：已有同源任务正在执行，source={payload.target_url}，keyword={payload.keyword}", "warn")
+                return
+            retry_payload = ScrapeRequest(
+                target_url=payload.target_url,
+                keyword=payload.keyword,
+                request_cookie=payload.request_cookie,
+                source_id=payload.source_id,
+                attempt=attempt + 1,
+            )
+            retry_id = start_sync_task(retry_payload, scheduled=True)
+            add_log(f"已创建定时同步重试：原任务={original_task_id}，新任务={retry_id}，第 {attempt + 1}/{SYNC_RETRY_MAX_ATTEMPTS} 次，原因={reason}", "warn")
+        except Exception as exc:
+            add_log(f"创建同步重试失败：{exc}", "error")
+
+    th = threading.Thread(target=delayed_retry, daemon=True)
+    th.start()
+
 def sync_task_worker(task_id: str, payload: ScrapeRequest, scheduled: bool = False) -> None:
     request_cookie = clean_cookie(payload.request_cookie)
-    run_id = create_sync_run(payload.target_url, payload.keyword, request_cookie, payload.source_id)
+    run_id = create_sync_run(payload.target_url, payload.keyword, request_cookie, payload.source_id, int(getattr(payload, "attempt", 1) or 1), scheduled)
 
     update_task(
         task_id,
@@ -1135,6 +1185,7 @@ def sync_task_worker(task_id: str, payload: ScrapeRequest, scheduled: bool = Fal
             finish_sync_run(run_id, "failed", error_message=message)
             update_task(task_id, status="failed", phase="任务失败", progress=100, message=message, finished_at=now_text())
             add_log(f"后台同步失败：task={task_id}，{message}", "error")
+            schedule_retry_task(task_id, payload, message, scheduled)
             return
 
         if len(new_data) == 0:
@@ -1146,6 +1197,7 @@ def sync_task_worker(task_id: str, payload: ScrapeRequest, scheduled: bool = Fal
             finish_sync_run(run_id, "empty", total_found=0, error_message=warning_message)
             update_task(task_id, status="empty", phase="空结果", progress=100, total_found=0, message=warning_message, finished_at=now_text())
             add_log(warning_message, "warn")
+            schedule_retry_task(task_id, payload, warning_message, scheduled)
             return
 
         update_task(task_id, phase="写入数据库", progress=86)
@@ -1184,6 +1236,7 @@ def sync_task_worker(task_id: str, payload: ScrapeRequest, scheduled: bool = Fal
         finish_sync_run(run_id, "failed", error_message=err)
         update_task(task_id, status="failed", phase="异常失败", progress=100, message=err, finished_at=now_text())
         add_log(f"后台同步异常：task={task_id}，{err}", "error")
+        schedule_retry_task(task_id, payload, err, scheduled)
 
 
 def start_sync_task(payload: ScrapeRequest, scheduled: bool = False) -> str:
@@ -1206,6 +1259,8 @@ def start_sync_task(payload: ScrapeRequest, scheduled: bool = False) -> str:
             "source_url": payload.target_url,
             "keyword": payload.keyword,
             "scheduled": scheduled,
+            "source_id": payload.source_id,
+            "attempt": int(getattr(payload, "attempt", 1) or 1),
         }
 
     th = threading.Thread(target=sync_task_worker, args=(task_id, payload, scheduled), daemon=True)
@@ -1228,6 +1283,7 @@ def scheduler_loop() -> None:
     while not SCHEDULER_STOP.is_set():
         try:
             auto_purify_expired_countdowns("scheduler")
+            maybe_auto_backup()
             conn = get_conn()
             rows = conn.execute(
                 """
@@ -1322,6 +1378,46 @@ def create_backup_file() -> Path:
 
     add_log(f"已创建备份：{out_file.name}", "info")
     return out_file
+
+
+def cleanup_old_backups(retention: int = AUTO_BACKUP_RETENTION_COUNT) -> int:
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    files = sorted(BACKUP_DIR.glob("*.tar.gz"), key=lambda x: x.stat().st_mtime, reverse=True)
+    removed = 0
+    for path in files[max(0, retention):]:
+        try:
+            path.unlink()
+            removed += 1
+        except Exception:
+            pass
+    if removed:
+        add_log(f"自动备份清理完成：删除旧备份 {removed} 个", "warn")
+    return removed
+
+
+def maybe_auto_backup() -> None:
+    if not AUTO_BACKUP_ENABLED:
+        return
+    try:
+        conn = get_conn()
+        row = conn.execute("SELECT value FROM app_meta WHERE key='last_auto_backup_at'").fetchone()
+        last = row["value"] if row else ""
+        due = True
+        if last:
+            last_dt = parse_db_time(last)
+            due = not last_dt or (bj_now() - last_dt).total_seconds() >= AUTO_BACKUP_INTERVAL_HOURS * 3600
+        if not due:
+            conn.close()
+            return
+        now = now_text()
+        conn.execute("INSERT OR REPLACE INTO app_meta(key, value) VALUES(?, ?)", ("last_auto_backup_at", now))
+        conn.commit()
+        conn.close()
+        create_backup_file()
+        cleanup_old_backups()
+        add_log("自动备份完成", "info")
+    except Exception as exc:
+        add_log(f"自动备份失败：{exc}", "error")
 
 
 def find_db_in_tar(tar_path: Path) -> bytes:
@@ -1644,12 +1740,15 @@ def api_stats(user: Dict[str, object] = Depends(require_user)):
         except Exception:
             return 0
 
-    safe = conn.execute("SELECT COUNT(*) FROM asset_records WHERE status_type='safe' OR status_timer LIKE '%已过期%' OR status_timer LIKE '%释放%'").fetchone()[0]
-    danger = conn.execute("SELECT COUNT(*) FROM asset_records WHERE COALESCE(status_type, '') NOT IN ('safe', 'unknown') AND status_timer NOT LIKE '%已过期%' AND status_timer NOT LIKE '%释放%'").fetchone()[0]
-    unknown = conn.execute("SELECT COUNT(*) FROM asset_records WHERE status_type='unknown' OR status_timer LIKE '%未知状态%'").fetchone()[0]
+    active_assets = conn.execute("SELECT COUNT(*) FROM asset_records WHERE deleted_at IS NULL").fetchone()[0]
+    trash_assets = conn.execute("SELECT COUNT(*) FROM asset_records WHERE deleted_at IS NOT NULL").fetchone()[0]
+    safe = conn.execute("SELECT COUNT(*) FROM asset_records WHERE deleted_at IS NULL AND (status_type='safe' OR status_timer LIKE '%已过期%' OR status_timer LIKE '%释放%')").fetchone()[0]
+    danger = conn.execute("SELECT COUNT(*) FROM asset_records WHERE deleted_at IS NULL AND COALESCE(status_type, '') NOT IN ('safe', 'unknown') AND status_timer NOT LIKE '%已过期%' AND status_timer NOT LIKE '%释放%'").fetchone()[0]
+    unknown = conn.execute("SELECT COUNT(*) FROM asset_records WHERE deleted_at IS NULL AND (status_type='unknown' OR status_timer LIKE '%未知状态%')").fetchone()[0]
 
     data = {
-        "assets": count("asset_records"),
+        "assets": active_assets,
+        "trash_assets": trash_assets,
         "sources": count("source_configs"),
         "users": count("users"),
         "logs": count("app_logs"),
@@ -1714,7 +1813,7 @@ def list_sources(user: Dict[str, object] = Depends(require_user)):
                s.enabled, s.sort_order, s.last_used_at, s.last_scheduled_at,
                s.last_success_at, s.last_failed_at, s.last_error,
                s.created_at, s.updated_at,
-               (SELECT COUNT(1) FROM asset_records a WHERE a.source_id=s.id) AS asset_count
+               (SELECT COUNT(1) FROM asset_records a WHERE a.source_id=s.id AND a.deleted_at IS NULL) AS asset_count
         FROM source_configs s
         ORDER BY s.enabled DESC, s.sort_order ASC, s.updated_at DESC, s.id DESC
     """).fetchall()
@@ -1841,11 +1940,11 @@ def delete_source(source_id: int, delete_assets: bool = False, user: Dict[str, o
         conn.close()
         return JSONResponse({"success": False, "message": "数据源不存在"}, status_code=404)
 
-    asset_count = conn.execute("SELECT COUNT(1) AS c FROM asset_records WHERE source_id=?", (source_id,)).fetchone()["c"]
+    asset_count = conn.execute("SELECT COUNT(1) AS c FROM asset_records WHERE source_id=? AND deleted_at IS NULL", (source_id,)).fetchone()["c"]
 
     if delete_assets:
-        conn.execute("DELETE FROM asset_records WHERE source_id=?", (source_id,))
-        asset_msg = f"，并删除 {asset_count} 条资产"
+        conn.execute("UPDATE asset_records SET deleted_at=?, deleted_by=?, delete_reason=? WHERE source_id=? AND deleted_at IS NULL", (now_text(), str(user.get("username", "")), "删除数据源时选择同时删除", source_id))
+        asset_msg = f"，并将 {asset_count} 条资产移入回收站"
     else:
         conn.execute("UPDATE asset_records SET source_id=NULL WHERE source_id=?", (source_id,))
         asset_msg = f"，保留 {asset_count} 条资产"
@@ -1860,6 +1959,39 @@ def delete_source(source_id: int, delete_assets: bool = False, user: Dict[str, o
 
     add_log(f"数据源已删除：{row['name']}{asset_msg}", "warn")
     return {"success": True, "message": f"数据源已删除{asset_msg}"}
+
+
+@app.post("/api/sources/{source_id}/test")
+def test_source(source_id: int, user: Dict[str, object] = Depends(require_user)):
+    conn = get_conn()
+    row = conn.execute("SELECT id, name, source_url, default_keyword, request_cookie FROM source_configs WHERE id=?", (source_id,)).fetchone()
+    conn.close()
+    if not row:
+        return JSONResponse({"success": False, "message": "数据源不存在"}, status_code=404)
+    keyword = row["default_keyword"] or ""
+    if not keyword:
+        return JSONResponse({"success": False, "message": "测试失败：默认关键词为空"}, status_code=400)
+    try:
+        started = time.time()
+        html = fetch_page_with_retry(row["source_url"], keyword, 1, row["request_cookie"] or "")
+        elapsed = round(time.time() - started, 2)
+        if not html:
+            msg = "测试失败：数据源未响应、Cookie 失效、网络受限或被目标站拦截"
+            add_log(f"数据源测试失败：{row['name']}，{msg}", "error")
+            return {"success": False, "message": msg, "elapsed": elapsed, "parsed": 0}
+        if "/_guard/auto.js" in html and len(html.strip()) < 200:
+            msg = "测试失败：目标站返回防护脚本，请更新 Cookie"
+            add_log(f"数据源测试失败：{row['name']}，{msg}", "warn")
+            return {"success": False, "message": msg, "elapsed": elapsed, "parsed": 0}
+        parsed = parse_by_source(row["source_url"], html)
+        msg = f"测试成功：响应 {len(html)} 字符，首页解析 {len(parsed)} 条，用时 {elapsed} 秒"
+        add_log(f"数据源测试成功：{row['name']}，首页解析 {len(parsed)} 条", "info")
+        return {"success": True, "message": msg, "elapsed": elapsed, "parsed": len(parsed)}
+    except Exception as exc:
+        msg = explain_request_exception(exc)
+        add_log(f"数据源测试异常：{row['name']}，{msg}", "error")
+        return {"success": False, "message": msg}
+
 
 
 @app.post("/api/sync_tasks")
@@ -1964,6 +2096,7 @@ def get_records(user: Dict[str, object] = Depends(require_user)):
               AND s.source_url = a.source_url
               AND (s.default_keyword = a.keyword OR s.default_keyword = '' OR a.keyword = '')
           )
+        WHERE a.deleted_at IS NULL
         ORDER BY a.last_checked DESC, a.id DESC
     """).fetchall()
     conn.close()
@@ -2016,6 +2149,7 @@ def export_records(
               AND s.source_url = a.source_url
               AND (s.default_keyword = a.keyword OR s.default_keyword = '' OR a.keyword = '')
           )
+        WHERE a.deleted_at IS NULL
         ORDER BY a.last_checked DESC, a.id DESC
     """).fetchall()
     conn.close()
@@ -2094,13 +2228,63 @@ def bulk_delete_records(payload: BulkDeleteRequest, user: Dict[str, object] = De
 
     placeholders = ",".join(["?"] * len(ids))
     conn = get_conn()
-    before = conn.execute(f"SELECT COUNT(*) FROM asset_records WHERE id IN ({placeholders})", ids).fetchone()[0]
-    conn.execute(f"DELETE FROM asset_records WHERE id IN ({placeholders})", ids)
+    before = conn.execute(f"SELECT COUNT(*) FROM asset_records WHERE deleted_at IS NULL AND id IN ({placeholders})", ids).fetchone()[0]
+    conn.execute(f"UPDATE asset_records SET deleted_at=?, deleted_by=?, delete_reason=? WHERE deleted_at IS NULL AND id IN ({placeholders})", [now_text(), str(user.get("username", "")), "手动删除"] + ids)
     conn.commit()
     conn.close()
 
-    add_log(f"批量删除资产记录：{before} 条", "warn")
-    return {"success": True, "message": f"已删除 {before} 条资产记录", "deleted_count": before}
+    add_log(f"资产记录已移入回收站：{before} 条", "warn")
+    return {"success": True, "message": f"已将 {before} 条资产移入回收站，可在系统维护中恢复", "deleted_count": before}
+
+
+
+@app.get("/api/records/trash")
+def list_deleted_records(user: Dict[str, object] = Depends(require_user)):
+    conn = get_conn()
+    rows = conn.execute("""
+        SELECT id, content_text, status_timer, source_url, keyword, deleted_at, deleted_by, delete_reason
+        FROM asset_records
+        WHERE deleted_at IS NOT NULL
+        ORDER BY deleted_at DESC, id DESC
+        LIMIT 200
+    """).fetchall()
+    conn.close()
+    return {"data": [dict(row) for row in rows]}
+
+
+@app.post("/api/records/restore")
+def restore_deleted_records(payload: BulkDeleteRequest, user: Dict[str, object] = Depends(require_user)):
+    ids = []
+    seen = set()
+    for raw_id in payload.ids or []:
+        try:
+            rid = int(raw_id)
+        except Exception:
+            continue
+        if rid > 0 and rid not in seen:
+            seen.add(rid)
+            ids.append(rid)
+    if not ids:
+        return JSONResponse({"success": False, "message": "没有可恢复的记录"}, status_code=400)
+    placeholders = ",".join(["?"] * len(ids))
+    conn = get_conn()
+    count = conn.execute(f"SELECT COUNT(*) FROM asset_records WHERE deleted_at IS NOT NULL AND id IN ({placeholders})", ids).fetchone()[0]
+    conn.execute(f"UPDATE asset_records SET deleted_at=NULL, deleted_by=NULL, delete_reason=NULL WHERE id IN ({placeholders})", ids)
+    conn.commit()
+    conn.close()
+    add_log(f"从回收站恢复资产记录：{count} 条", "info")
+    return {"success": True, "message": f"已恢复 {count} 条资产记录", "restored_count": count}
+
+
+@app.delete("/api/records/trash")
+def purge_deleted_records(user: Dict[str, object] = Depends(require_user)):
+    conn = get_conn()
+    count = conn.execute("SELECT COUNT(*) FROM asset_records WHERE deleted_at IS NOT NULL").fetchone()[0]
+    conn.execute("DELETE FROM asset_records WHERE deleted_at IS NOT NULL")
+    conn.commit()
+    conn.close()
+    add_log(f"已永久清空回收站：{count} 条", "warn")
+    return {"success": True, "message": f"已永久删除 {count} 条回收站资产", "deleted_count": count}
 
 
 
@@ -2772,10 +2956,15 @@ input,select,textarea,button{max-width:100%;min-width:0}
   .status-tabs{grid-template-columns:repeat(2,minmax(0,1fr))!important}
 }
 
-/* v10 stability and comfort polish */
+/* v11 stability and comfort polish */
 .copy-btn.copied{background:#dcfce7!important;border-color:#86efac!important;color:#166534!important}
 .danger-text{color:#b42318!important;font-weight:800!important}
 @media (min-width:641px){
+  .asset-table{display:table!important;width:100%!important;border-collapse:separate!important;border-spacing:0 8px!important}
+  .asset-table .record{display:table-row!important;background:transparent!important;box-shadow:none!important;border:0!important;padding:0!important}
+  .asset-table .record-select{display:contents!important}
+  .asset-table .record-body{display:contents!important}
+  .asset-table .record-head{display:grid!important;grid-template-columns:minmax(420px,1fr) 86px 86px!important;align-items:center!important;gap:10px!important;background:#fff!important;border:1px solid var(--line)!important;border-radius:12px!important;padding:10px 12px!important}
   .quick-grid{grid-template-columns:minmax(260px,1fr) minmax(220px,1fr) auto auto!important}
   #addressList{display:grid!important;gap:8px!important}
   .record{border-radius:14px!important;padding:12px 14px!important}
@@ -2865,6 +3054,7 @@ input,select,textarea,button{max-width:100%;min-width:0}
 <div class="panel-head">
 <h2>资产看板</h2>
 <div class="actions">
+<button class="btn" onclick="copyVisibleSafeAddresses()">复制纯净地址</button>
 <button class="btn" onclick="exportCurrentCsv()">导出 CSV</button>
 <button class="btn" onclick="fetchAll()">刷新</button>
 </div>
@@ -2905,7 +3095,7 @@ input,select,textarea,button{max-width:100%;min-width:0}
 </div>
 </details>
 
-<ul id="addressList" class="list"></ul>
+<ul id="addressList" class="list asset-table"></ul>
 <div class="pagination">
 <button class="btn" id="prevBtn" onclick="changePage(-1)">上一页</button>
 <span id="pageInfo">第 1 / 1 页</span>
@@ -2926,6 +3116,7 @@ input,select,textarea,button{max-width:100%;min-width:0}
 <h2>数据源编辑</h2>
 <div class="actions">
 <button class="btn" onclick="newSource()">新建</button>
+<button class="btn" onclick="testSelectedSource()">测试连接</button>
 <button class="btn primary" id="saveSourceBtn" onclick="saveSource()">保存</button>
 <button class="btn danger" onclick="deleteSource()">删除</button>
 </div>
@@ -3037,6 +3228,11 @@ input,select,textarea,button{max-width:100%;min-width:0}
 </div>
 
 <div class="panel">
+<div class="panel-head"><h2>回收站</h2><div class="actions"><button class="btn" onclick="loadTrash()">刷新</button><button class="btn" onclick="restoreSelectedTrash()">恢复勾选</button><button class="btn danger" onclick="purgeTrash()">清空回收站</button></div></div>
+<div id="trashList" class="source-list"></div>
+</div>
+
+<div class="panel">
 <div class="panel-head"><h2>运行日志</h2></div>
 <div id="logBox" class="notice logbox">暂无日志。</div>
 </div>
@@ -3060,6 +3256,12 @@ let taskPollTimer = null;
 window.onload = () => {
     updateClock();
     setInterval(updateClock, 1000);
+    if (window.matchMedia && window.matchMedia("(max-width: 640px)").matches) {
+        currentStatus = "safe";
+        document.querySelectorAll(".status-tabs button").forEach(x => x.classList.remove("active"));
+        const btn = $("statusBtn_safe");
+        if (btn) btn.classList.add("active");
+    }
     fetchAll();
     fetchLogs();
     fetchSyncRuns();
@@ -3085,6 +3287,7 @@ function showTab(name) {
     const titles = {home:"首页", assets:"资产看板", sources:"数据源管理", backup:"备份恢复", system:"系统维护"};
     $("pageTitle").innerText = titles[name] || "资产智能管控台";
     if ($("mobilePageTitle")) $("mobilePageTitle").innerText = titles[name] || "资产智能管控台";
+    if (name === "system") loadTrash();
     closeDrawer();
 }
 
@@ -3310,6 +3513,33 @@ async function loadSources() {
     } catch (e) {
         msg("加载数据源失败。", "bad");
     }
+}
+
+
+async function testSelectedSource() {
+    const id = $("sourceSelect").value;
+    if (!id) { msg("请先选择一个已保存的数据源。", "warn"); return; }
+    msg("正在测试数据源连接，请稍候...", "");
+    try {
+        const r = await apiFetch(`/api/sources/${id}/test`, {method:"POST"});
+        if (!r) return;
+        const j = await r.json();
+        msg(j.message || "测试完成", j.success ? "ok" : "bad");
+        fetchLogs();
+    } catch (e) {
+        msg("测试连接失败。", "bad");
+    }
+}
+
+function visibleSafeAddresses() {
+    return filteredData().filter(x => cls(x.status_timer, x.status_type) === "safe").map(x => String(x.content_text || "").trim()).filter(Boolean);
+}
+
+async function copyVisibleSafeAddresses() {
+    const rows = visibleSafeAddresses();
+    if (!rows.length) { msg("当前筛选下没有纯净地址。", "warn"); return; }
+    await copyAddress(rows.join("\n"), null);
+    msg(`已复制 ${rows.length} 条纯净地址`, "ok");
 }
 
 async function saveSource() {
@@ -3821,6 +4051,55 @@ function renderSyncRuns() {
         `;
         home.appendChild(item);
     });
+}
+
+
+async function loadTrash() {
+    const box = $("trashList");
+    if (!box) return;
+    try {
+        const r = await apiFetch("/api/records/trash");
+        if (!r) return;
+        const j = await r.json();
+        const rows = j.data || [];
+        if (!rows.length) { box.innerHTML = `<div class="empty">回收站为空。</div>`; return; }
+        box.innerHTML = rows.map(x => `
+            <div class="item">
+                <label style="display:flex;gap:8px;align-items:flex-start;margin:0">
+                    <input type="checkbox" class="trash-check" value="${Number(x.id)}" style="width:auto;min-height:auto;margin-top:3px">
+                    <div>
+                        <div class="item-title">${escapeHtml(x.content_text || "")}</div>
+                        <div class="item-meta"><span>删除时间：${escapeHtml(x.deleted_at || "-")}</span><span>状态：${escapeHtml(x.status_timer || "-")}</span><span>关键词：${escapeHtml(x.keyword || "-")}</span></div>
+                    </div>
+                </label>
+            </div>
+        `).join("");
+    } catch (e) { box.innerHTML = `<div class="empty">回收站加载失败。</div>`; }
+}
+
+function selectedTrashIds() {
+    return Array.from(document.querySelectorAll(".trash-check:checked")).map(x => parseInt(x.value)).filter(x => Number.isInteger(x) && x > 0);
+}
+
+async function restoreSelectedTrash() {
+    const ids = selectedTrashIds();
+    if (!ids.length) { msg("请先勾选要恢复的资产。", "warn"); return; }
+    const r = await apiFetch("/api/records/restore", {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({ids})});
+    if (!r) return;
+    const j = await r.json();
+    msg(j.message || "恢复完成", j.success ? "ok" : "bad");
+    await fetchRecords();
+    loadTrash();
+}
+
+async function purgeTrash() {
+    const t = prompt("这会永久删除回收站内所有资产，无法恢复。请输入 DELETE 确认：");
+    if (t !== "DELETE") { msg("已取消清空回收站。", "warn"); return; }
+    const r = await apiFetch("/api/records/trash", {method:"DELETE"});
+    if (!r) return;
+    const j = await r.json();
+    msg(j.message || "清空完成", j.success ? "ok" : "bad");
+    loadTrash();
 }
 
 async function fetchLogs() {

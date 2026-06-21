@@ -1,18 +1,18 @@
-# asset-app v10
+# asset-app v11 稳定增强版
 
-资产智能管控台。当前版本在 v9 同步修复基础上，继续优化稳定性和日常操作体验。
+FastAPI 资产管理工具，支持数据源同步、资产看板、移动端极简查看、数据源归类、自动备份和回收站。
 
-## v10 更新
+## v11 新增
 
-- 自动同步增加更清晰的状态字段：`last_scheduled_at`、`last_success_at`、`last_failed_at`、`last_error`。
-- 定时同步不再把“已创建任务”误当成“已成功同步”。同步成功、失败会分开记录。
-- 数据源列表显示资产数量、上次成功时间和失败原因。
-- 删除数据源更安全：默认只删除数据源配置并保留资产；只有输入 `DELETE` 才会一起删除该数据源下的资产。
-- 新增“同步全部启用”按钮，可批量创建所有启用数据源的同步任务。
-- 地址复制按钮增加“已复制”反馈。
-- PC 端资产列表和数据源列表做了轻量整理，手机端继续保持极简资产视图。
+- 自动同步失败后自动重试，默认最多 3 次，每次间隔 5 分钟。
+- 数据源管理增加“测试连接”，可快速检查网址、Cookie 和首页解析结果。
+- 手机端默认只看“纯净可用”资产，主界面保持地址 + 状态 + 复制按钮。
+- PC 端资产列表优化为更紧凑的表格化布局。
+- 增加“复制纯净地址”，可一键复制当前筛选下的全部纯净地址。
+- 增加数据库自动备份，默认每 24 小时备份一次，保留最近 7 个备份。
+- 删除资产改为进入回收站，可恢复；清空回收站才会永久删除。
 
-## 运行
+## 部署
 
 ```bash
 docker compose up -d --build
@@ -20,25 +20,27 @@ docker compose up -d --build
 
 ## 环境变量
 
-复制示例文件：
+复制 `.env.example` 为 `.env` 后按需修改。
 
 ```bash
 cp .env.example .env
 ```
 
-常用配置：
+重要配置：
 
 ```env
 DB_PATH=/app/data/asset_management.db
+BACKUP_DIR=/app/export_backups
 COOKIE_SECURE=false
-REGISTRATION_ENABLED=true
-REQUEST_TIMEOUT_SECONDS=30
-MAX_PAGES=2000
+AUTO_BACKUP_ENABLED=true
+AUTO_BACKUP_INTERVAL_HOURS=24
+AUTO_BACKUP_RETENTION_COUNT=7
+SYNC_RETRY_ENABLED=true
+SYNC_RETRY_MAX_ATTEMPTS=3
+SYNC_RETRY_DELAY_SECONDS=300
 ```
 
-如果使用 HTTPS，可以把 `COOKIE_SECURE=true`。
-
-## 数据库
+## 数据文件
 
 SQLite 数据库不进入 Git：
 
@@ -46,23 +48,14 @@ SQLite 数据库不进入 Git：
 data/asset_management.db
 ```
 
-迁移服务器时，把数据库复制到新服务器的 `data/asset_management.db`，然后修复权限：
-
-```bash
-mkdir -p data export_backups
-chown -R 10001:10001 data export_backups
-chmod -R u+rwX,g+rwX data export_backups
-```
-
 ## 备份
 
-建议定期备份数据库：
+手动创建备份可在后台“备份恢复”里操作。v11 也会自动定时备份数据库和核心代码文件。
+
+## GitHub 上传
 
 ```bash
-mkdir -p /root/asset-db-backups
-cp data/asset_management.db /root/asset-db-backups/asset_management_$(date +%F_%H%M).db
+git add .
+git commit -m "Improve stability and workflow"
+git push
 ```
-
-## Git 忽略
-
-`.env`、数据库、备份目录、缓存目录都不应上传到 GitHub。

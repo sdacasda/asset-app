@@ -3471,6 +3471,100 @@ input,select,textarea,button{max-width:100%;min-width:0}
 .bulk-task-mini{height:8px;background:#eef2f7;border-radius:999px;overflow:hidden}
 .bulk-task-mini div{height:100%;background:#1677ff;border-radius:999px;transition:width .25s ease}
 @media(max-width:640px){.bulk-task-head{display:block}.bulk-task-head span{display:block;margin-top:4px}.bulk-task-row{grid-template-columns:1fr}.bulk-task-list{max-height:52vh}.bulk-task-mini{height:7px}}
+
+
+/* v18 mobile bottom pagination polish */
+@media (max-width:640px){
+  .pagination{
+    position:sticky!important;
+    bottom:0!important;
+    z-index:24!important;
+    display:grid!important;
+    grid-template-columns:minmax(84px,1fr) auto minmax(84px,1fr)!important;
+    grid-template-areas:
+      "prev info next"
+      "jump jump jump"!important;
+    gap:8px!important;
+    align-items:center!important;
+    margin:8px -8px 0!important;
+    padding:8px 8px calc(8px + env(safe-area-inset-bottom,0px))!important;
+    border-top:1px solid #e2e8f0!important;
+    background:rgba(238,242,247,.97)!important;
+    backdrop-filter:blur(10px)!important;
+  }
+  #prevBtn{grid-area:prev!important}
+  #nextBtn{grid-area:next!important}
+  #pageInfo{
+    grid-area:info!important;
+    text-align:center!important;
+    font-size:13px!important;
+    font-weight:800!important;
+    color:#475467!important;
+    white-space:nowrap!important;
+    padding:0 4px!important;
+  }
+  .pagination .btn{
+    height:40px!important;
+    width:100%!important;
+    min-width:0!important;
+    border-radius:14px!important;
+    background:#fff!important;
+    border:1px solid #e2e8f0!important;
+    color:#101828!important;
+    font-size:14px!important;
+    font-weight:900!important;
+    box-shadow:0 4px 12px rgba(15,23,42,.04)!important;
+  }
+  .pagination .btn:not(:disabled):active{transform:scale(.98)!important}
+  .pagination .btn:disabled{
+    opacity:.45!important;
+    color:#98a2b3!important;
+    background:#f8fafc!important;
+    box-shadow:none!important;
+  }
+  .page-jump{
+    grid-area:jump!important;
+    display:grid!important;
+    grid-template-columns:minmax(0,1fr) 84px!important;
+    gap:8px!important;
+    align-items:center!important;
+  }
+  .page-jump input{
+    width:100%!important;
+    height:40px!important;
+    border:1px solid #d8e0ea!important;
+    border-radius:14px!important;
+    background:#fff!important;
+    padding:0 12px!important;
+    text-align:center!important;
+    font-size:14px!important;
+    font-weight:800!important;
+    outline:none!important;
+  }
+  .page-jump input:focus{border-color:#1677ff!important;box-shadow:0 0 0 3px rgba(22,119,255,.12)!important}
+  .pagination.one-page{
+    grid-template-columns:1fr!important;
+    grid-template-areas:"info"!important;
+    padding:8px 8px calc(8px + env(safe-area-inset-bottom,0px))!important;
+  }
+  .pagination.one-page #prevBtn,
+  .pagination.one-page #nextBtn,
+  .pagination.one-page .page-jump{display:none!important}
+  .pagination.one-page #pageInfo{
+    height:36px!important;
+    display:flex!important;
+    align-items:center!important;
+    justify-content:center!important;
+    background:#fff!important;
+    border:1px solid #e2e8f0!important;
+    border-radius:14px!important;
+  }
+}
+@media (max-width:380px){
+  .pagination{grid-template-columns:minmax(76px,1fr) auto minmax(76px,1fr)!important;gap:6px!important}
+  .pagination .btn,.page-jump input{height:38px!important;font-size:13px!important}
+  #pageInfo{font-size:12px!important}
+}
 </style>
 </head>
 <body>
@@ -3594,7 +3688,7 @@ input,select,textarea,button{max-width:100%;min-width:0}
 <div class="pagination">
 <button class="btn" id="prevBtn" onclick="changePage(-1)">上一页</button>
 <span id="pageInfo">第 1 / 1 页</span>
-<div class="page-jump"><input id="jumpPageInput" type="number" min="1" placeholder="页码" onkeydown="if(event.key==='Enter') jumpToPage()"><button class="btn" onclick="jumpToPage()">跳转</button></div>
+<div class="page-jump"><input id="jumpPageInput" type="number" inputmode="numeric" min="1" placeholder="输入页码" onkeydown="if(event.key==='Enter') jumpToPage()"><button class="btn" onclick="jumpToPage()">跳转</button></div>
 <button class="btn" id="nextBtn" onclick="changePage(1)">下一页</button>
 </div>
 </div>
@@ -4531,6 +4625,8 @@ function renderList(reset = false) {
     $("pageInfo").textContent = `第 ${currentPage} / ${pages} 页`;
     $("prevBtn").disabled = currentPage === 1;
     $("nextBtn").disabled = currentPage === pages;
+    const paginationEl = document.querySelector(".pagination");
+    if (paginationEl) paginationEl.classList.toggle("one-page", pages <= 1);
     $("addressList").innerHTML = "";
 
     const part = arr.slice((currentPage - 1) * size, (currentPage - 1) * size + size);

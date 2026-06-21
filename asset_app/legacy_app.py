@@ -34,6 +34,8 @@ from pydantic import BaseModel
 
 DB_PATH = os.getenv("DB_PATH", "asset_management.db")
 APP_NAME = os.getenv("APP_NAME", "资产智能管控台")
+APP_VERSION = os.getenv("APP_VERSION", "v23")
+APP_BUILD_TIME = os.getenv("APP_BUILD_TIME", "2026-06-22")
 SESSION_COOKIE_NAME = "asset_session"
 SESSION_DAYS = int(os.getenv("SESSION_DAYS", "7"))
 PBKDF2_ITERATIONS = int(os.getenv("PBKDF2_ITERATIONS", "260000"))
@@ -455,6 +457,10 @@ def init_db() -> None:
     ensure_column(conn, "sync_runs", "source_id", "INTEGER")
     ensure_column(conn, "sync_runs", "attempt", "INTEGER NOT NULL DEFAULT 1")
     ensure_column(conn, "sync_runs", "scheduled", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "sync_runs", "unchanged_count", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "sync_runs", "clean_to_risk_count", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "sync_runs", "risk_to_clean_count", "INTEGER NOT NULL DEFAULT 0")
+    ensure_column(conn, "sync_runs", "expired_to_clean_count", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "asset_records", "deleted_at", "TEXT")
     ensure_column(conn, "asset_records", "deleted_by", "TEXT")
     ensure_column(conn, "asset_records", "delete_reason", "TEXT")
@@ -683,6 +689,35 @@ def normalize_status_fields(status_text: str) -> Tuple[str, Optional[int], str]:
         return "countdown", hours, raw
 
     return "countdown", None, raw
+
+
+
+def transition_bucket(status_text: str, status_type: str = "") -> str:
+    """Return a stable bucket for sync diff display: safe / risk / unknown."""
+    stype = (status_type or "").strip().lower()
+    text = status_text or ""
+    if stype == "safe" or is_available_status(text):
+        return "safe"
+    if stype == "unknown" or "未知状态" in text or not text:
+        return "unknown"
+    return "risk"
+
+
+def status_transition_counts(old_status_text: str, old_status_type: str, new_status_text: str, new_status_type: str) -> Dict[str, int]:
+    old_bucket = transition_bucket(old_status_text, old_status_type)
+    new_bucket = transition_bucket(new_status_text, new_status_type)
+    out = {
+        "unchanged_count": 0,
+        "clean_to_risk_count": 0,
+        "risk_to_clean_count": 0,
+    }
+    if old_bucket == new_bucket:
+        out["unchanged_count"] = 1
+    elif old_bucket == "safe" and new_bucket == "risk":
+        out["clean_to_risk_count"] = 1
+    elif old_bucket == "risk" and new_bucket == "safe":
+        out["risk_to_clean_count"] = 1
+    return out
 
 
 def parse_countdown_minutes(status_text: str) -> Optional[int]:
@@ -1102,6 +1137,10 @@ def finish_sync_run(
     inserted_count: int = 0,
     updated_count: int = 0,
     restored_from_available: int = 0,
+    unchanged_count: int = 0,
+    clean_to_risk_count: int = 0,
+    risk_to_clean_count: int = 0,
+    expired_to_clean_count: int = 0,
     error_message: str = "",
 ) -> None:
     try:
@@ -1114,6 +1153,10 @@ def finish_sync_run(
                 inserted_count=?,
                 updated_count=?,
                 restored_from_available=?,
+                unchanged_count=?,
+                clean_to_risk_count=?,
+                risk_to_clean_count=?,
+                expired_to_clean_count=?,
                 finished_at=?,
                 error_message=?
             WHERE id=?
@@ -1124,6 +1167,10 @@ def finish_sync_run(
                 int(inserted_count or 0),
                 int(updated_count or 0),
                 int(restored_from_available or 0),
+                int(unchanged_count or 0),
+                int(clean_to_risk_count or 0),
+                int(risk_to_clean_count or 0),
+                int(expired_to_clean_count or 0),
                 now_text(),
                 error_message or "",
                 run_id,
@@ -1292,6 +1339,10 @@ def write_sync_results(task_id: str, run_id: int, payload: ScrapeRequest, new_da
     inserted_count = 0
     updated_count = 0
     restored_from_available = 0
+    unchanged_count = 0
+    clean_to_risk_count = 0
+    risk_to_clean_count = 0
+    expired_to_clean_count = 0
 
     conn = get_conn()
     cur = conn.cursor()
@@ -1315,7 +1366,7 @@ def write_sync_results(task_id: str, run_id: int, payload: ScrapeRequest, new_da
         if source_id:
             old = cur.execute(
                 """
-                SELECT id, status_timer
+                SELECT id, status_timer, status_type
                 FROM asset_records
                 WHERE source_id=? AND content_text=?
                   AND deleted_at IS NULL
@@ -1328,7 +1379,7 @@ def write_sync_results(task_id: str, run_id: int, payload: ScrapeRequest, new_da
         if old is None:
             old = cur.execute(
                 """
-                SELECT id, status_timer
+                SELECT id, status_timer, status_type
                 FROM asset_records
                 WHERE source_url=? AND content_text=?
                   AND deleted_at IS NULL
@@ -1374,7 +1425,12 @@ def write_sync_results(task_id: str, run_id: int, payload: ScrapeRequest, new_da
         else:
             updated_count += 1
             old_status = old["status_timer"] or ""
-            if is_available_status(old_status) and not is_available_status(status_timer):
+            old_status_type = old["status_type"] if "status_type" in old.keys() else ""
+            diff = status_transition_counts(old_status, old_status_type, status_timer, status_type)
+            unchanged_count += diff["unchanged_count"]
+            clean_to_risk_count += diff["clean_to_risk_count"]
+            risk_to_clean_count += diff["risk_to_clean_count"]
+            if diff["clean_to_risk_count"]:
                 restored_from_available += 1
             cur.execute(
                 """
@@ -1429,6 +1485,7 @@ def write_sync_results(task_id: str, run_id: int, payload: ScrapeRequest, new_da
             """,
             ("已过期(纯净可用)", current_time, "safe", -1, "已过期(纯净可用)", keyword, source_id, "%已过期%", "%释放%"),
         )
+        expired_to_clean_count += max(0, cur.rowcount or 0)
     else:
         cur.execute(
             """
@@ -1449,6 +1506,7 @@ def write_sync_results(task_id: str, run_id: int, payload: ScrapeRequest, new_da
             """,
             ("已过期(纯净可用)", current_time, "safe", -1, "已过期(纯净可用)", keyword, target_url, "%已过期%", "%释放%"),
         )
+        expired_to_clean_count += max(0, cur.rowcount or 0)
 
     if source_id:
         cur.execute(
@@ -1463,6 +1521,10 @@ def write_sync_results(task_id: str, run_id: int, payload: ScrapeRequest, new_da
         "inserted_count": inserted_count,
         "updated_count": updated_count,
         "restored_from_available": restored_from_available,
+        "unchanged_count": unchanged_count,
+        "clean_to_risk_count": clean_to_risk_count,
+        "risk_to_clean_count": risk_to_clean_count,
+        "expired_to_clean_count": expired_to_clean_count,
     }
 
 
@@ -1554,11 +1616,16 @@ def sync_task_worker(task_id: str, payload: ScrapeRequest, scheduled: bool = Fal
             inserted_count=counts["inserted_count"],
             updated_count=counts["updated_count"],
             restored_from_available=counts["restored_from_available"],
+            unchanged_count=counts.get("unchanged_count", 0),
+            clean_to_risk_count=counts.get("clean_to_risk_count", 0),
+            risk_to_clean_count=counts.get("risk_to_clean_count", 0),
+            expired_to_clean_count=counts.get("expired_to_clean_count", 0),
         )
         update_sync_job(job_id, status="success", last_error="", finished_at=now_text())
 
         restored_note = f"，其中 {counts['restored_from_available']} 条从纯净可用恢复为倒计时状态" if counts["restored_from_available"] else ""
-        message = f"同步完成！解析 {len(new_data)} 条，新增 {counts['inserted_count']} 条，更新 {counts['updated_count']} 条{restored_note}。"
+        diff_note = f"；状态变化：纯净转风控 {counts.get('clean_to_risk_count', 0)}，风控转纯净 {counts.get('risk_to_clean_count', 0)}，失效转纯净 {counts.get('expired_to_clean_count', 0)}"
+        message = f"同步完成！解析 {len(new_data)} 条，新增 {counts['inserted_count']} 条，更新 {counts['updated_count']} 条{restored_note}{diff_note}。"
 
         update_task(
             task_id,
@@ -1570,6 +1637,10 @@ def sync_task_worker(task_id: str, payload: ScrapeRequest, scheduled: bool = Fal
             inserted_count=counts["inserted_count"],
             updated_count=counts["updated_count"],
             restored_from_available=counts["restored_from_available"],
+            unchanged_count=counts.get("unchanged_count", 0),
+            clean_to_risk_count=counts.get("clean_to_risk_count", 0),
+            risk_to_clean_count=counts.get("risk_to_clean_count", 0),
+            expired_to_clean_count=counts.get("expired_to_clean_count", 0),
             finished_at=now_text(),
         )
 
@@ -2098,6 +2169,11 @@ def logout(request: Request):
     return response
 
 
+@app.get("/api/version")
+def api_version(user: Dict[str, object] = Depends(require_user)):
+    return {"version": APP_VERSION, "build_time": APP_BUILD_TIME, "time": now_text()}
+
+
 @app.get("/api/stats")
 def api_stats(user: Dict[str, object] = Depends(require_user)):
     auto_purify_expired_countdowns("stats")
@@ -2128,6 +2204,8 @@ def api_stats(user: Dict[str, object] = Depends(require_user)):
         "db_path": str(Path(DB_PATH).resolve()),
         "db_size": Path(DB_PATH).stat().st_size if Path(DB_PATH).exists() else 0,
         "time": now_text(),
+        "version": APP_VERSION,
+        "build_time": APP_BUILD_TIME,
     }
 
     conn.close()
@@ -2162,6 +2240,7 @@ def api_sync_runs(user: Dict[str, object] = Depends(require_user)):
         """
         SELECT r.id, r.source_id, COALESCE(s.name, r.source_url) AS source_name, r.source_url, r.keyword, r.used_proxy, r.used_cookie, r.status,
                r.total_found, r.inserted_count, r.updated_count, r.restored_from_available,
+               r.unchanged_count, r.clean_to_risk_count, r.risk_to_clean_count, r.expired_to_clean_count,
                r.started_at, r.finished_at, r.error_message
         FROM sync_runs r
         LEFT JOIN source_configs s ON s.id = r.source_id
@@ -2984,6 +3063,12 @@ button{width:100%;height:48px;margin-top:22px;border:0;border-radius:10px;backgr
   #addressList.asset-table .record-check{display:none!important}
 }
 
+
+.version-pill{display:inline-flex;align-items:center;gap:6px;width:max-content;margin-top:6px;padding:3px 9px;border-radius:999px;background:#eef6ff;color:#155eef;border:1px solid #cfe3ff;font-size:12px;font-weight:900}
+.runtime-check{font-size:12px;color:#667085;margin-top:6px}
+.js-error-banner{display:none;position:fixed;left:12px;right:12px;bottom:12px;z-index:9999;background:#fff1f0;border:1px solid #ffccc7;color:#a8071a;padding:10px 12px;border-radius:12px;font-size:13px;box-shadow:0 8px 30px rgba(15,23,42,.16)}
+.js-error-banner.show{display:block}
+.sync-diff-line{margin-top:6px;color:#475467;font-weight:700}
 </style>
 </head>
 <body>
@@ -3565,6 +3650,12 @@ input,select,textarea,button{max-width:100%;min-width:0}
   .pagination .btn,.page-jump input{height:38px!important;font-size:13px!important}
   #pageInfo{font-size:12px!important}
 }
+
+.version-pill{display:inline-flex;align-items:center;gap:6px;width:max-content;margin-top:6px;padding:3px 9px;border-radius:999px;background:#eef6ff;color:#155eef;border:1px solid #cfe3ff;font-size:12px;font-weight:900}
+.runtime-check{font-size:12px;color:#667085;margin-top:6px}
+.js-error-banner{display:none;position:fixed;left:12px;right:12px;bottom:12px;z-index:9999;background:#fff1f0;border:1px solid #ffccc7;color:#a8071a;padding:10px 12px;border-radius:12px;font-size:13px;box-shadow:0 8px 30px rgba(15,23,42,.16)}
+.js-error-banner.show{display:block}
+.sync-diff-line{margin-top:6px;color:#475467;font-weight:700}
 </style>
 </head>
 <body>
@@ -3577,7 +3668,7 @@ input,select,textarea,button{max-width:100%;min-width:0}
 <button class="mobile-only btn" style="margin-bottom:12px" onclick="closeDrawer()">关闭菜单</button>
 <div class="brand">
 <div class="logo">资</div>
-<div><b>资产智能管控台</b><span>管理后台</span></div>
+<div><b>资产智能管控台</b><span>管理后台</span><em class="version-pill">__APP_VERSION__</em></div>
 </div>
 <div class="nav">
 <button data-tab="home" onclick="showTab('home')">快速同步</button>
@@ -3598,7 +3689,7 @@ input,select,textarea,button{max-width:100%;min-width:0}
 <h1 id="pageTitle">资产看板</h1>
 <div class="desc" id="clockText">本地时间 --</div>
 </div>
-<div class="desc" id="dbInfo">数据库加载中...</div>
+<div><div class="desc" id="dbInfo">数据库加载中...</div><div class="runtime-check">当前版本：<b>__APP_VERSION__</b> · 构建：__APP_BUILD_TIME__</div></div>
 </div>
 
 <div class="content">
@@ -3814,7 +3905,7 @@ input,select,textarea,button{max-width:100%;min-width:0}
 <button class="btn warn" onclick="cleanupMaintenance()">清理旧日志</button>
 </div>
 </div>
-<div id="systemInfo" class="notice">系统运行正常。</div>
+<div id="systemInfo" class="notice">系统运行正常。</div><div class="notice" style="margin-top:10px">当前版本：<b>__APP_VERSION__</b>　构建时间：__APP_BUILD_TIME__。如果页面异常，请先确认这里的版本号和容器内版本一致。</div>
 </div>
 
 <div class="panel">
@@ -3831,7 +3922,10 @@ input,select,textarea,button{max-width:100%;min-width:0}
 </main>
 </div>
 
+<div id="jsErrorBanner" class="js-error-banner"></div>
 <script>
+window.addEventListener("error", function(e){try{var b=document.getElementById("jsErrorBanner"); if(b){b.textContent="页面脚本异常："+(e.message||"未知错误")+"。请刷新或回滚到稳定版。"; b.classList.add("show");}}catch(_){}});
+window.addEventListener("unhandledrejection", function(e){try{var b=document.getElementById("jsErrorBanner"); if(b){b.textContent="页面请求异常："+((e.reason&&e.reason.message)||e.reason||"未知错误")+"。"; b.classList.add("show");}}catch(_){}});
 const $ = (id) => document.getElementById(id);
 
 let globalData = [];
@@ -4319,6 +4413,7 @@ function renderTaskMessage(task) {
 页数：${task.current_page || 0} / ${task.total_pages || 0}<br>
 已解析：${task.total_found || 0} 条<br>
 ${task.message ? ("结果：" + escapeHtml(task.message) + "<br>") : ""}
+${["success","failed","empty","cancelled"].includes(task.status) ? (`状态变化：纯净→风控 ${task.clean_to_risk_count || 0}，风控→纯净 ${task.risk_to_clean_count || 0}，失效→纯净 ${task.expired_to_clean_count || 0}<br>`) : ""}
 <div class="progress-wrap"><div class="progress-bar" style="width:${progress}%"></div></div>
 `;
 }
@@ -4381,6 +4476,8 @@ async function pollCurrentTasks() {
             await fetchAll();
             fetchLogs();
             fetchSyncRuns();
+            const failed = tasks.filter(t => ["failed", "empty", "cancelled"].includes(t.status)).length;
+            msg(failed ? `批量同步完成，其中 ${failed} 个任务异常。` : "批量同步完成。", failed ? "warn" : "ok");
             return;
         }
         clearTimeout(taskPollTimer);
@@ -4416,6 +4513,10 @@ async function pollCurrentTask() {
             await fetchAll();
             fetchLogs();
             fetchSyncRuns();
+            if (task.status === "success") msg("同步完成。", "ok");
+            else if (task.status === "empty") msg("同步完成，但没有解析到结果。", "warn");
+            else if (task.status === "cancelled") msg("同步已取消。", "warn");
+            else msg(task.message || "同步失败。", "bad");
             return;
         }
 
@@ -4761,16 +4862,27 @@ function renderSyncRuns() {
 
         const item = document.createElement("div");
         item.className = "item";
+        const cleanToRisk = x.clean_to_risk_count || 0;
+        const riskToClean = x.risk_to_clean_count || 0;
+        const expiredToClean = x.expired_to_clean_count || 0;
+        const unchanged = x.unchanged_count || 0;
+        const sourceTitle = x.source_name || x.keyword || "-";
         item.innerHTML = `
             <div class="item-head">
-                <div class="item-title">${escapeHtml(x.keyword || "-")} ｜ ${escapeHtml(x.source_url || "-")}</div>
+                <div class="item-title">${escapeHtml(sourceTitle)} ｜ ${escapeHtml(x.keyword || "-")}</div>
                 <span class="badge ${clsName}">${text}</span>
             </div>
             <div class="item-meta">
                 <span>解析：${x.total_found || 0}</span>
                 <span>新增：${x.inserted_count || 0}</span>
                 <span>更新：${x.updated_count || 0}</span>
+                <span>未变：${unchanged}</span>
                 <span>时间：${escapeHtml(x.started_at || "-")}</span>
+            </div>
+            <div class="item-meta sync-diff-line">
+                <span>状态变化：纯净→风控 ${cleanToRisk}</span>
+                <span>风控→纯净 ${riskToClean}</span>
+                <span>失效→纯净 ${expiredToClean}</span>
             </div>
         `;
         home.appendChild(item);
@@ -5003,4 +5115,4 @@ async function calibrateStatus() {
 </body>
 </html>
 """
-    return html.replace("__USERNAME__", html_escape(username))
+    return html.replace("__USERNAME__", html_escape(username)).replace("__APP_VERSION__", APP_VERSION).replace("__APP_BUILD_TIME__", APP_BUILD_TIME)

@@ -1,91 +1,39 @@
-# asset-app v14
+# asset-app v23 稳定运维版
 
-资产智能管控台。v14 合并了数据源健康监控和 PC 端表格体验优化：同步任务继续使用 v13 的持久化队列，PC 端资产列表更紧凑，勾选框直接放到地址行前面。
+本版本以 **v18 稳定版** 为基础，只做低风险优化，不改资产同步核心逻辑。
 
-## v14 改动
+## v23 新增
 
-- 数据源列表新增健康状态：正常、需检查、同步中、待同步、未定时、已停用。
-- 数据源接口返回活跃任务数、失败任务数、健康说明，方便判断哪个源有问题。
-- PC 端资产列表重新整理为更紧凑的表格化卡片。
-- 勾选框移动到每条地址前方，删除勾选记录时不再占用上方空白区域。
-- 修复 PC 端纯净 / 风控状态标签尺寸和对齐问题。
-- 保持手机端极简资产查看模式。
-- 保留 v13 的 `sync_jobs` 持久化同步队列。
+- 页面和系统维护区显示当前版本号 `v23`。
+- 页面响应头加入 `X-Asset-App-Version`，方便确认容器实际版本。
+- 首页、登录页、注册页禁用缓存，减少浏览器看到旧页面的问题。
+- 前端脚本异常时会在页面底部显示错误提示，避免按钮点不动但不知道原因。
+- 新增 `scripts/emergency_backup.sh`：一键紧急备份数据库和当前代码。
+- 新增 `scripts/smoke_check.sh`：部署后检查版本、健康状态和数据库数量。
+- 新增 `scripts/safe_update.sh`：以后更新包可以更安全地执行备份、解压、重建、检查。
 
-## 运行
-
-```bash
-docker compose up -d --build
-```
-
-## 本地运行
+## 部署
 
 ```bash
-pip install -r requirements.txt
-uvicorn app:app --host 0.0.0.0 --port 8000
+cd /root/recovered-asset-app
+cp app/asset_app/legacy_app.py /root/legacy_app_before_v23.py
+tar -xzvf asset-app-v23-safe-ops.tar.gz
+
+cd /root/recovered-asset-app/app
+chown -R 10001:10001 data export_backups
+chmod -R u+rwX,g+rwX data export_backups
+
+docker compose down
+docker compose build --no-cache
+docker compose up -d
+./scripts/smoke_check.sh
 ```
 
-## 数据文件
+## 重要说明
 
-默认数据库路径建议使用：
-
-```text
-/app/data/asset_management.db
-```
-
-不要把下面这些提交到 GitHub：
-
-```text
-.env
-*.db
-*.sqlite
-*.sqlite3
-data/
-backups/
-export_backups/
-__pycache__/
-```
-
-## 后续计划
-
-下一步建议继续拆分：
-
-```text
-asset_app/services/sync_service.py
-asset_app/routes/sync.py
-asset_app/routes/assets.py
-asset_app/routes/sources.py
-asset_app/static/app.css
-asset_app/static/app.js
-asset_app/templates/index.html
-```
-
-## v15
-
-- 增加旧网址别名分类修复，避免历史资产因为网址变更变成未知分类。
-- 内置旧网址归属：盛世、万盛、嘉盛。
-- 数据源修改网址时自动记录旧网址别名。
-- 资产看板分页增加页码输入跳转。
-
-## v18
-
-- 批量同步现在会在“当前任务”面板中显示总体进度。
-- 同步全部启用时会显示完成数量、成功数量、异常数量、每个数据源任务进度。
-- 取消任务支持同时取消批量同步创建的多个任务。
-- 单个同步任务和批量同步任务都保留进度条反馈，避免只显示顶部提示。
-
-## v18 更新
-
-- 同一标签下同一地址只显示一条记录，即使来自不同历史网址。
-- 风控优先级高于纯净：同一地址同时出现风控和纯净时，保留风控状态。
-- 重复记录会软删除进入回收站，不会直接物理删除。
-- 导出 CSV 也会按相同规则去重。
+v23 不合并 v19-v21 的高风险前端改动。原因是 v21 曾导致页面按钮失效。后续如需继续恢复“同步状态变化展示”等功能，建议单独做小版本，每次只改一个点并验证。
 
 
-## v18 mobile pagination polish
+## v23
 
-- 手机端底部分页改为两行紧凑布局。
-- 第一行：上一页 / 当前页码 / 下一页。
-- 第二行：输入页码 / 跳转。
-- 只有 1 页时自动隐藏无意义按钮，只显示当前页。
-- 按钮尺寸、圆角、禁用状态统一，减少底部大面积留白。
+基于 v22/v18 稳定代码，小步恢复 v21 的关键体验：版本号显示、同步完成提示清理、最近同步状态变化展示。

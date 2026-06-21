@@ -1,0 +1,13 @@
+.env
+*.db
+*.sqlite
+*.sqlite3
+backups/
+export_backups/
+__pycache__/
+*.pyc
+.venv/
+venv/
+logs/
+*.log
+.DS_Store

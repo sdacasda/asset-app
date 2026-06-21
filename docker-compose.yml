@@ -1,0 +1,25 @@
+services:
+  asset-app:
+    build:
+      context: /opt/asset-console
+      dockerfile: Dockerfile
+    container_name: asset-app
+    ports:
+      - "127.0.0.1:8088:8000"
+    environment:
+      REGISTRATION_ENABLED: "false"
+      SCRAPE_WORKERS: "1"
+      REQUEST_TIMEOUT_SECONDS: "30"
+      DB_PATH: "asset_management.db"
+      COOKIE_SECURE: "true"
+    volumes:
+      - /opt/asset-console/app.py:/app/app.py
+      - /opt/asset-console/asset_management.db:/app/asset_management.db
+      - /opt/asset-console/export_backups:/app/export_backups
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()"]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 20s

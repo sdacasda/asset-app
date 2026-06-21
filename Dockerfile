@@ -10,6 +10,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
+COPY asset_app ./asset_app
+COPY asset_app ./asset_app
+COPY docs ./docs
 
 RUN useradd -r -u 10001 appuser \
     && mkdir -p /app/data /app/export_backups \

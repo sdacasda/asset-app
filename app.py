@@ -214,6 +214,10 @@ def init_db() -> None:
     ensure_column(conn, "source_configs", "enabled", "INTEGER NOT NULL DEFAULT 1")
     ensure_column(conn, "source_configs", "sort_order", "INTEGER NOT NULL DEFAULT 0")
     ensure_column(conn, "source_configs", "last_used_at", "TEXT")
+    ensure_column(conn, "source_configs", "last_scheduled_at", "TEXT")
+    ensure_column(conn, "source_configs", "last_success_at", "TEXT")
+    ensure_column(conn, "source_configs", "last_failed_at", "TEXT")
+    ensure_column(conn, "source_configs", "last_error", "TEXT")
     ensure_column(conn, "source_configs", "created_at", "TEXT")
     ensure_column(conn, "source_configs", "updated_at", "TEXT")
     ensure_column(conn, "sync_runs", "source_id", "INTEGER")
@@ -780,6 +784,20 @@ def finish_sync_run(
                 run_id,
             ),
         )
+        row = conn.execute("SELECT source_id FROM sync_runs WHERE id=?", (run_id,)).fetchone()
+        if row and row["source_id"]:
+            sid = int(row["source_id"])
+            now = now_text()
+            if status == "success":
+                conn.execute(
+                    "UPDATE source_configs SET last_success_at=?, last_error='', updated_at=? WHERE id=?",
+                    (now, now, sid),
+                )
+            elif status in ("failed", "empty", "cancelled"):
+                conn.execute(
+                    "UPDATE source_configs SET last_failed_at=?, last_error=?, updated_at=? WHERE id=?",
+                    (now, (error_message or status)[:500], now, sid),
+                )
         conn.commit()
         conn.close()
     except Exception as exc:
@@ -1214,7 +1232,8 @@ def scheduler_loop() -> None:
             rows = conn.execute(
                 """
                 SELECT id, name, source_url, default_keyword, request_cookie,
-                       schedule_enabled, schedule_interval_minutes, last_used_at
+                       schedule_enabled, schedule_interval_minutes, last_used_at,
+                       last_scheduled_at, last_success_at, last_failed_at, last_error
                 FROM source_configs
                 WHERE enabled=1
                   AND schedule_enabled=1
@@ -1234,14 +1253,14 @@ def scheduler_loop() -> None:
                 if not keyword or interval < 5:
                     continue
 
-                last_used_at = row["last_used_at"]
+                last_mark = row["last_scheduled_at"] or row["last_used_at"]
                 due = False
 
-                if not last_used_at:
+                if not last_mark:
                     due = True
                 else:
                     try:
-                        last_dt = datetime.strptime(last_used_at, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone(timedelta(hours=8)))
+                        last_dt = datetime.strptime(last_mark, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone(timedelta(hours=8)))
                         due = (now_dt - last_dt).total_seconds() >= interval * 60
                     except Exception:
                         due = True
@@ -1254,7 +1273,7 @@ def scheduler_loop() -> None:
 
                 throttle_conn = get_conn()
                 throttle_conn.execute(
-                    "UPDATE source_configs SET last_used_at=?, updated_at=? WHERE id=?",
+                    "UPDATE source_configs SET last_scheduled_at=?, updated_at=? WHERE id=?",
                     (now_text(), now_text(), int(row["id"])),
                 )
                 throttle_conn.commit()
@@ -1690,11 +1709,14 @@ def api_sync_runs(user: Dict[str, object] = Depends(require_user)):
 def list_sources(user: Dict[str, object] = Depends(require_user)):
     conn = get_conn()
     rows = conn.execute("""
-        SELECT id, name, source_url, default_keyword, request_cookie,
-               schedule_enabled, schedule_interval_minutes,
-               enabled, sort_order, last_used_at, created_at, updated_at
-        FROM source_configs
-        ORDER BY enabled DESC, sort_order ASC, updated_at DESC, id DESC
+        SELECT s.id, s.name, s.source_url, s.default_keyword, s.request_cookie,
+               s.schedule_enabled, s.schedule_interval_minutes,
+               s.enabled, s.sort_order, s.last_used_at, s.last_scheduled_at,
+               s.last_success_at, s.last_failed_at, s.last_error,
+               s.created_at, s.updated_at,
+               (SELECT COUNT(1) FROM asset_records a WHERE a.source_id=s.id) AS asset_count
+        FROM source_configs s
+        ORDER BY s.enabled DESC, s.sort_order ASC, s.updated_at DESC, s.id DESC
     """).fetchall()
     conn.close()
     return {"data": [dict(row) for row in rows]}
@@ -1812,9 +1834,22 @@ def update_source(source_id: int, payload: SourceConfigPayload, user: Dict[str, 
 
 
 @app.delete("/api/sources/{source_id}")
-def delete_source(source_id: int, user: Dict[str, object] = Depends(require_user)):
+def delete_source(source_id: int, delete_assets: bool = False, user: Dict[str, object] = Depends(require_user)):
     conn = get_conn()
     row = conn.execute("SELECT name FROM source_configs WHERE id=?", (source_id,)).fetchone()
+    if not row:
+        conn.close()
+        return JSONResponse({"success": False, "message": "数据源不存在"}, status_code=404)
+
+    asset_count = conn.execute("SELECT COUNT(1) AS c FROM asset_records WHERE source_id=?", (source_id,)).fetchone()["c"]
+
+    if delete_assets:
+        conn.execute("DELETE FROM asset_records WHERE source_id=?", (source_id,))
+        asset_msg = f"，并删除 {asset_count} 条资产"
+    else:
+        conn.execute("UPDATE asset_records SET source_id=NULL WHERE source_id=?", (source_id,))
+        asset_msg = f"，保留 {asset_count} 条资产"
+
     cur = conn.execute("DELETE FROM source_configs WHERE id=?", (source_id,))
     conn.commit()
     changed = cur.rowcount
@@ -1823,8 +1858,8 @@ def delete_source(source_id: int, user: Dict[str, object] = Depends(require_user
     if not changed:
         return JSONResponse({"success": False, "message": "数据源不存在"}, status_code=404)
 
-    add_log(f"数据源已删除：{row['name'] if row else source_id}", "warn")
-    return {"success": True, "message": "数据源已删除"}
+    add_log(f"数据源已删除：{row['name']}{asset_msg}", "warn")
+    return {"success": True, "message": f"数据源已删除{asset_msg}"}
 
 
 @app.post("/api/sync_tasks")
@@ -1840,6 +1875,37 @@ def create_sync_task(payload: ScrapeRequest, user: Dict[str, object] = Depends(r
 
     task_id = start_sync_task(payload, scheduled=False)
     return {"success": True, "message": "后台同步任务已创建", "task_id": task_id}
+
+
+@app.post("/api/sync_tasks/all_enabled")
+def create_all_enabled_sync_tasks(user: Dict[str, object] = Depends(require_user)):
+    conn = get_conn()
+    rows = conn.execute(
+        """
+        SELECT id, name, source_url, default_keyword, request_cookie
+        FROM source_configs
+        WHERE enabled=1 AND COALESCE(default_keyword, '') <> ''
+        ORDER BY sort_order ASC, id ASC
+        """
+    ).fetchall()
+    conn.close()
+
+    created = []
+    skipped = []
+    for row in rows:
+        if has_running_task_for_source(row["source_url"], row["default_keyword"] or ""):
+            skipped.append(row["name"])
+            continue
+        payload = ScrapeRequest(
+            target_url=row["source_url"],
+            keyword=row["default_keyword"] or "",
+            request_cookie=row["request_cookie"] or "",
+            source_id=int(row["id"]),
+        )
+        created.append({"source": row["name"], "task_id": start_sync_task(payload, scheduled=False)})
+
+    add_log(f"批量同步已创建：{len(created)} 个任务，跳过 {len(skipped)} 个", "info")
+    return {"success": True, "message": f"已创建 {len(created)} 个同步任务，跳过 {len(skipped)} 个正在运行的数据源", "created": created, "skipped": skipped}
 
 
 @app.post("/api/search_and_scrape")
@@ -2705,6 +2771,22 @@ input,select,textarea,button{max-width:100%;min-width:0}
 @media (max-width:380px){
   .status-tabs{grid-template-columns:repeat(2,minmax(0,1fr))!important}
 }
+
+/* v10 stability and comfort polish */
+.copy-btn.copied{background:#dcfce7!important;border-color:#86efac!important;color:#166534!important}
+.danger-text{color:#b42318!important;font-weight:800!important}
+@media (min-width:641px){
+  .quick-grid{grid-template-columns:minmax(260px,1fr) minmax(220px,1fr) auto auto!important}
+  #addressList{display:grid!important;gap:8px!important}
+  .record{border-radius:14px!important;padding:12px 14px!important}
+  .record-head{grid-template-columns:minmax(420px,1fr) auto auto!important;align-items:center!important}
+  .addr{font-size:15px!important;line-height:1.45!important}
+  .meta{margin-top:6px!important;font-size:12px!important;gap:6px 14px!important}
+  .source-list .item-meta{display:flex!important;flex-wrap:wrap!important;gap:8px 14px!important}
+}
+@media (max-width:640px){
+  .quick-grid{grid-template-columns:1fr!important}
+}
 </style>
 </head>
 <body>
@@ -2760,6 +2842,7 @@ input,select,textarea,button{max-width:100%;min-width:0}
 </select>
 <input id="quickKeyword" placeholder="关键词会自动带出，也可手动修改">
 <button class="btn primary" onclick="startQuickSync()">开始同步</button>
+<button class="btn" onclick="syncAllEnabled()">同步全部启用</button>
 </div>
 </div>
 
@@ -3201,6 +3284,9 @@ async function loadSources() {
                     <span>关键词：${escapeHtml(s.default_keyword || "-")}</span>
                     <span>Cookie：${s.request_cookie ? "有" : "无"}</span>
                     <span>定时：${s.schedule_enabled ? (s.schedule_interval_minutes + " 分钟") : "关闭"}</span>
+                    <span>资产：${s.asset_count || 0} 条</span>
+                    <span>上次成功：${escapeHtml(s.last_success_at || "-")}</span>
+                    ${s.last_error ? `<span class="danger-text">失败：${escapeHtml(s.last_error)}</span>` : ""}
                 </div>
             `;
             item.onclick = () => {
@@ -3269,19 +3355,44 @@ async function deleteSource() {
         msg("请先选择一个已保存的数据源。", "warn");
         return;
     }
-    if (!confirm("确定删除这个数据源配置吗？不会删除已经入库的资产记录。")) return;
+    const s = selectedSource();
+    const count = s ? (s.asset_count || 0) : 0;
+    if (!confirm(`确定删除数据源「${s ? sourceDisplayName(s) : id}」吗？\n当前关联资产：${count} 条。\n默认只删除数据源配置，资产会保留。`)) return;
+
+    let deleteAssets = false;
+    if (count > 0) {
+        const text = prompt(`如需同时删除该数据源下 ${count} 条资产，请输入 DELETE。\n直接留空或取消则只删除数据源配置，保留资产。`);
+        deleteAssets = text === "DELETE";
+    }
 
     try {
-        const r = await apiFetch("/api/sources/" + id, {method: "DELETE"});
+        const r = await apiFetch("/api/sources/" + id + "?delete_assets=" + (deleteAssets ? "true" : "false"), {method: "DELETE"});
         if (!r) return;
         const j = await r.json();
         msg(j.message || "数据源已删除", j.success ? "ok" : "bad");
         newSource();
         await loadSources();
         fetchStats();
+        fetchRecords();
         fetchLogs();
     } catch (e) {
         msg("删除数据源失败。", "bad");
+    }
+}
+
+async function syncAllEnabled() {
+    if (!confirm("将为所有启用且填写了默认关键词的数据源创建同步任务。确定继续吗？")) return;
+    try {
+        msg("正在创建批量同步任务...", "");
+        const r = await apiFetch("/api/sync_tasks/all_enabled", {method: "POST"});
+        if (!r) return;
+        const j = await r.json();
+        msg(j.message || "批量任务已创建", j.success ? "ok" : "bad");
+        showTab("home");
+        fetchLogs();
+        fetchSyncRuns();
+    } catch (e) {
+        msg("创建批量同步任务失败。", "bad");
     }
 }
 
@@ -3531,7 +3642,7 @@ function filteredData() {
 
 
 
-async function copyAddress(text) {
+async function copyAddress(text, btn) {
     const value = String(text || "").trim();
     if (!value) return;
     try {
@@ -3547,6 +3658,12 @@ async function copyAddress(text) {
             ta.select();
             document.execCommand("copy");
             ta.remove();
+        }
+        if (btn) {
+            const old = btn.textContent;
+            btn.textContent = "已复制";
+            btn.classList.add("copied");
+            setTimeout(() => { btn.textContent = old || "复制"; btn.classList.remove("copied"); }, 1200);
         }
         msg("地址已复制", "ok");
     } catch (e) {
@@ -3601,7 +3718,7 @@ function renderList(reset = false) {
             </div>
         `;
         const copyBtn = li.querySelector(".copy-btn");
-        if (copyBtn) copyBtn.addEventListener("click", () => copyAddress(x.content_text || ""));
+        if (copyBtn) copyBtn.addEventListener("click", () => copyAddress(x.content_text || "", copyBtn));
         $("addressList").appendChild(li);
     });
 }

@@ -1,61 +1,82 @@
-# asset-app v11 稳定增强版
+# asset-app v14
 
-FastAPI 资产管理工具，支持数据源同步、资产看板、移动端极简查看、数据源归类、自动备份和回收站。
+资产智能管控台。v14 合并了数据源健康监控和 PC 端表格体验优化：同步任务继续使用 v13 的持久化队列，PC 端资产列表更紧凑，勾选框直接放到地址行前面。
 
-## v11 新增
+## v14 改动
 
-- 自动同步失败后自动重试，默认最多 3 次，每次间隔 5 分钟。
-- 数据源管理增加“测试连接”，可快速检查网址、Cookie 和首页解析结果。
-- 手机端默认只看“纯净可用”资产，主界面保持地址 + 状态 + 复制按钮。
-- PC 端资产列表优化为更紧凑的表格化布局。
-- 增加“复制纯净地址”，可一键复制当前筛选下的全部纯净地址。
-- 增加数据库自动备份，默认每 24 小时备份一次，保留最近 7 个备份。
-- 删除资产改为进入回收站，可恢复；清空回收站才会永久删除。
+- 数据源列表新增健康状态：正常、需检查、同步中、待同步、未定时、已停用。
+- 数据源接口返回活跃任务数、失败任务数、健康说明，方便判断哪个源有问题。
+- PC 端资产列表重新整理为更紧凑的表格化卡片。
+- 勾选框移动到每条地址前方，删除勾选记录时不再占用上方空白区域。
+- 修复 PC 端纯净 / 风控状态标签尺寸和对齐问题。
+- 保持手机端极简资产查看模式。
+- 保留 v13 的 `sync_jobs` 持久化同步队列。
 
-## 部署
+## 运行
 
 ```bash
 docker compose up -d --build
 ```
 
-## 环境变量
-
-复制 `.env.example` 为 `.env` 后按需修改。
+## 本地运行
 
 ```bash
-cp .env.example .env
-```
-
-重要配置：
-
-```env
-DB_PATH=/app/data/asset_management.db
-BACKUP_DIR=/app/export_backups
-COOKIE_SECURE=false
-AUTO_BACKUP_ENABLED=true
-AUTO_BACKUP_INTERVAL_HOURS=24
-AUTO_BACKUP_RETENTION_COUNT=7
-SYNC_RETRY_ENABLED=true
-SYNC_RETRY_MAX_ATTEMPTS=3
-SYNC_RETRY_DELAY_SECONDS=300
+pip install -r requirements.txt
+uvicorn app:app --host 0.0.0.0 --port 8000
 ```
 
 ## 数据文件
 
-SQLite 数据库不进入 Git：
+默认数据库路径建议使用：
 
 ```text
-data/asset_management.db
+/app/data/asset_management.db
 ```
 
-## 备份
+不要把下面这些提交到 GitHub：
 
-手动创建备份可在后台“备份恢复”里操作。v11 也会自动定时备份数据库和核心代码文件。
-
-## GitHub 上传
-
-```bash
-git add .
-git commit -m "Improve stability and workflow"
-git push
+```text
+.env
+*.db
+*.sqlite
+*.sqlite3
+data/
+backups/
+export_backups/
+__pycache__/
 ```
+
+## 后续计划
+
+下一步建议继续拆分：
+
+```text
+asset_app/services/sync_service.py
+asset_app/routes/sync.py
+asset_app/routes/assets.py
+asset_app/routes/sources.py
+asset_app/static/app.css
+asset_app/static/app.js
+asset_app/templates/index.html
+```
+
+## v15
+
+- 增加旧网址别名分类修复，避免历史资产因为网址变更变成未知分类。
+- 内置旧网址归属：盛世、万盛、嘉盛。
+- 数据源修改网址时自动记录旧网址别名。
+- 资产看板分页增加页码输入跳转。
+
+## v17
+
+- 批量同步现在会在“当前任务”面板中显示总体进度。
+- 同步全部启用时会显示完成数量、成功数量、异常数量、每个数据源任务进度。
+- 取消任务支持同时取消批量同步创建的多个任务。
+- 单个同步任务和批量同步任务都保留进度条反馈，避免只显示顶部提示。
+
+## v17 更新
+
+- 同一标签下同一地址只显示一条记录，即使来自不同历史网址。
+- 风控优先级高于纯净：同一地址同时出现风控和纯净时，保留风控状态。
+- 重复记录会软删除进入回收站，不会直接物理删除。
+- 导出 CSV 也会按相同规则去重。

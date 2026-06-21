@@ -2,6 +2,7 @@
 *.db
 *.sqlite
 *.sqlite3
+data/
 backups/
 export_backups/
 __pycache__/

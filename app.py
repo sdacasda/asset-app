@@ -46,6 +46,12 @@ REGISTRATION_ENABLED = os.getenv("REGISTRATION_ENABLED", "true").lower() in ("1"
 ALLOW_PRIVATE_SOURCE = os.getenv("ALLOW_PRIVATE_SOURCE", "false").lower() in ("1", "true", "yes", "on")
 ALLOWED_SOURCE_HOSTS = [x.strip().lower() for x in os.getenv("ALLOWED_SOURCE_HOSTS", "").split(",") if x.strip()]
 BACKUP_DIR = Path(os.getenv("BACKUP_DIR", "export_backups"))
+MAX_BACKUP_UPLOAD_BYTES = int(os.getenv("MAX_BACKUP_UPLOAD_MB", "50")) * 1024 * 1024
+
+LOGIN_LOCK = threading.Lock()
+LOGIN_ATTEMPTS: Dict[str, List[float]] = {}
+MAX_LOGIN_ATTEMPTS = int(os.getenv("MAX_LOGIN_ATTEMPTS", "8"))
+LOGIN_WINDOW_SECONDS = int(os.getenv("LOGIN_WINDOW_SECONDS", "900"))
 
 if not VERIFY_SSL:
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -194,6 +200,7 @@ def init_db() -> None:
         )
     """)
 
+    ensure_column(conn, "asset_records", "source_id", "INTEGER")
     ensure_column(conn, "asset_records", "status_type", "TEXT")
     ensure_column(conn, "asset_records", "remaining_hours", "INTEGER")
     ensure_column(conn, "asset_records", "raw_status", "TEXT")
@@ -209,7 +216,30 @@ def init_db() -> None:
     ensure_column(conn, "source_configs", "last_used_at", "TEXT")
     ensure_column(conn, "source_configs", "created_at", "TEXT")
     ensure_column(conn, "source_configs", "updated_at", "TEXT")
+    ensure_column(conn, "sync_runs", "source_id", "INTEGER")
 
+    # 让资产记录优先绑定到数据源 ID。这样以后数据源网址变更，历史资产仍按“标题/标签”归类。
+    # 同一个网址可能对应多个标题/关键词，所以迁移时优先匹配 source_url + keyword。
+    cur.execute("""
+        UPDATE asset_records
+        SET source_id = (
+            SELECT source_configs.id
+            FROM source_configs
+            WHERE source_configs.source_url = asset_records.source_url
+              AND (source_configs.default_keyword = asset_records.keyword OR source_configs.default_keyword = '' OR asset_records.keyword = '')
+            ORDER BY source_configs.updated_at DESC, source_configs.id DESC
+            LIMIT 1
+        )
+        WHERE source_id IS NULL
+          AND EXISTS (
+              SELECT 1
+              FROM source_configs
+              WHERE source_configs.source_url = asset_records.source_url
+                AND (source_configs.default_keyword = asset_records.keyword OR source_configs.default_keyword = '' OR asset_records.keyword = '')
+          )
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_asset_source_id ON asset_records(source_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_asset_source_keyword ON asset_records(source_url, keyword)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_asset_last_checked ON asset_records(last_checked)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_asset_status ON asset_records(status_timer)")
@@ -701,14 +731,14 @@ def parse_by_source(source_url: str, html_text: str) -> List[Dict[str, str]]:
     return parse_text_fallback(html_text)
 
 
-def create_sync_run(source_url: str, keyword: str, request_cookie: str) -> int:
+def create_sync_run(source_url: str, keyword: str, request_cookie: str, source_id: Optional[int] = None) -> int:
     conn = get_conn()
     cur = conn.execute(
         """
-        INSERT INTO sync_runs(source_url, keyword, used_proxy, used_cookie, status, started_at)
-        VALUES(?, ?, 0, ?, ?, ?)
+        INSERT INTO sync_runs(source_id, source_url, keyword, used_proxy, used_cookie, status, started_at)
+        VALUES(?, ?, ?, 0, ?, ?, ?)
         """,
-        (source_url, keyword, 1 if request_cookie else 0, "running", now_text()),
+        (source_id, source_url, keyword, 1 if request_cookie else 0, "running", now_text()),
     )
     conn.commit()
     run_id = int(cur.lastrowid)
@@ -892,6 +922,7 @@ def write_sync_results(task_id: str, run_id: int, payload: ScrapeRequest, new_da
     target_url = validate_target_url(payload.target_url)
     keyword = payload.keyword.strip()
     current_time = now_text()
+    source_id = int(payload.source_id) if payload.source_id else None
 
     inserted_count = 0
     updated_count = 0
@@ -915,46 +946,83 @@ def write_sync_results(task_id: str, run_id: int, payload: ScrapeRequest, new_da
 
         cur.execute("INSERT OR IGNORE INTO current_scraped(content_text) VALUES(?)", (content,))
 
-        old = cur.execute(
-            """
-            SELECT status_timer
-            FROM asset_records
-            WHERE source_url=? AND content_text=?
-            """,
-            (target_url, content),
-        ).fetchone()
+        old = None
+        if source_id:
+            old = cur.execute(
+                """
+                SELECT id, status_timer
+                FROM asset_records
+                WHERE source_id=? AND content_text=?
+                ORDER BY last_checked DESC, id DESC
+                LIMIT 1
+                """,
+                (source_id, content),
+            ).fetchone()
+
+        if old is None:
+            old = cur.execute(
+                """
+                SELECT id, status_timer
+                FROM asset_records
+                WHERE source_url=? AND content_text=?
+                ORDER BY last_checked DESC, id DESC
+                LIMIT 1
+                """,
+                (target_url, content),
+            ).fetchone()
 
         if old is None:
             inserted_count += 1
+            cur.execute(
+                """
+                INSERT INTO asset_records(
+                    source_id, source_url, keyword, content_text, status_timer, last_checked,
+                    status_type, remaining_hours, raw_status
+                )
+                VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_id,
+                    target_url,
+                    keyword,
+                    content,
+                    status_timer,
+                    current_time,
+                    status_type,
+                    remaining_hours,
+                    raw_status,
+                ),
+            )
         else:
             updated_count += 1
             old_status = old["status_timer"] or ""
             if is_available_status(old_status) and not is_available_status(status_timer):
                 restored_from_available += 1
-
-        cur.execute("""
-            INSERT INTO asset_records(
-                source_url, keyword, content_text, status_timer, last_checked,
-                status_type, remaining_hours, raw_status
+            cur.execute(
+                """
+                UPDATE asset_records
+                SET source_id = COALESCE(?, source_id),
+                    source_url = ?,
+                    keyword = ?,
+                    status_timer = ?,
+                    last_checked = ?,
+                    status_type = ?,
+                    remaining_hours = ?,
+                    raw_status = ?
+                WHERE id = ?
+                """,
+                (
+                    source_id,
+                    target_url,
+                    keyword,
+                    status_timer,
+                    current_time,
+                    status_type,
+                    remaining_hours,
+                    raw_status,
+                    old["id"],
+                ),
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(source_url, content_text) DO UPDATE SET
-                keyword = excluded.keyword,
-                status_timer = excluded.status_timer,
-                last_checked = excluded.last_checked,
-                status_type = excluded.status_type,
-                remaining_hours = excluded.remaining_hours,
-                raw_status = excluded.raw_status
-        """, (
-            target_url,
-            keyword,
-            content,
-            status_timer,
-            current_time,
-            status_type,
-            remaining_hours,
-            raw_status,
-        ))
 
         if idx % 50 == 0:
             update_task(
@@ -963,26 +1031,49 @@ def write_sync_results(task_id: str, run_id: int, payload: ScrapeRequest, new_da
                 progress=85 + int(idx / max(len(new_data), 1) * 12),
             )
 
-    cur.execute("""
-        UPDATE asset_records
-        SET status_timer = ?,
-            last_checked = ?,
-            status_type = ?,
-            remaining_hours = ?,
-            raw_status = ?
-        WHERE keyword = ?
-          AND source_url = ?
-          AND NOT EXISTS (
-              SELECT 1 FROM current_scraped c WHERE c.content_text = asset_records.content_text
-          )
-          AND status_timer NOT LIKE ?
-          AND status_timer NOT LIKE ?
-    """, ("已过期(纯净可用)", current_time, "safe", -1, "已过期(纯净可用)", keyword, target_url, "%已过期%", "%释放%"))
+    if source_id:
+        cur.execute(
+            """
+            UPDATE asset_records
+            SET status_timer = ?,
+                last_checked = ?,
+                status_type = ?,
+                remaining_hours = ?,
+                raw_status = ?
+            WHERE keyword = ?
+              AND source_id = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM current_scraped c WHERE c.content_text = asset_records.content_text
+              )
+              AND status_timer NOT LIKE ?
+              AND status_timer NOT LIKE ?
+            """,
+            ("已过期(纯净可用)", current_time, "safe", -1, "已过期(纯净可用)", keyword, source_id, "%已过期%", "%释放%"),
+        )
+    else:
+        cur.execute(
+            """
+            UPDATE asset_records
+            SET status_timer = ?,
+                last_checked = ?,
+                status_type = ?,
+                remaining_hours = ?,
+                raw_status = ?
+            WHERE keyword = ?
+              AND source_url = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM current_scraped c WHERE c.content_text = asset_records.content_text
+              )
+              AND status_timer NOT LIKE ?
+              AND status_timer NOT LIKE ?
+            """,
+            ("已过期(纯净可用)", current_time, "safe", -1, "已过期(纯净可用)", keyword, target_url, "%已过期%", "%释放%"),
+        )
 
-    if payload.source_id:
+    if source_id:
         cur.execute(
             "UPDATE source_configs SET last_used_at=?, updated_at=? WHERE id=?",
-            (current_time, current_time, payload.source_id),
+            (current_time, current_time, source_id),
         )
 
     conn.commit()
@@ -994,10 +1085,9 @@ def write_sync_results(task_id: str, run_id: int, payload: ScrapeRequest, new_da
         "restored_from_available": restored_from_available,
     }
 
-
 def sync_task_worker(task_id: str, payload: ScrapeRequest, scheduled: bool = False) -> None:
     request_cookie = clean_cookie(payload.request_cookie)
-    run_id = create_sync_run(payload.target_url, payload.keyword, request_cookie)
+    run_id = create_sync_run(payload.target_url, payload.keyword, request_cookie, payload.source_id)
 
     update_task(
         task_id,
@@ -1371,9 +1461,56 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title=APP_NAME, lifespan=lifespan)
 
 
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+    return response
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "service": "asset-console", "time": now_text()}
+
+
+
+def get_client_ip(request: Request) -> str:
+    forwarded_for = request.headers.get("x-forwarded-for", "")
+    if forwarded_for:
+        return forwarded_for.split(",", 1)[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def is_login_rate_limited(request: Request) -> bool:
+    key = get_client_ip(request)
+    now = time.time()
+    cutoff = now - LOGIN_WINDOW_SECONDS
+
+    with LOGIN_LOCK:
+        attempts = [ts for ts in LOGIN_ATTEMPTS.get(key, []) if ts >= cutoff]
+        LOGIN_ATTEMPTS[key] = attempts
+        return len(attempts) >= MAX_LOGIN_ATTEMPTS
+
+
+def record_login_failure(request: Request) -> None:
+    key = get_client_ip(request)
+    now = time.time()
+    cutoff = now - LOGIN_WINDOW_SECONDS
+
+    with LOGIN_LOCK:
+        attempts = [ts for ts in LOGIN_ATTEMPTS.get(key, []) if ts >= cutoff]
+        attempts.append(now)
+        LOGIN_ATTEMPTS[key] = attempts
+
+
+def clear_login_failures(request: Request) -> None:
+    key = get_client_ip(request)
+
+    with LOGIN_LOCK:
+        LOGIN_ATTEMPTS.pop(key, None)
 
 
 @app.get("/login", response_class=HTMLResponse)
@@ -1384,7 +1521,10 @@ def login_page(request: Request):
 
 
 @app.post("/login")
-def login_action(username: str = Form(...), password: str = Form(...)):
+def login_action(request: Request, username: str = Form(...), password: str = Form(...)):
+    if is_login_rate_limited(request):
+        return HTMLResponse(render_auth_page("login", "登录失败次数过多，请稍后再试"), status_code=429)
+
     username = username.strip()
 
     conn = get_conn()
@@ -1395,12 +1535,14 @@ def login_action(username: str = Form(...), password: str = Form(...)):
 
     if not row or not verify_password(password, row["password_hash"]):
         conn.close()
+        record_login_failure(request)
         return HTMLResponse(render_auth_page("login", "用户名或密码不正确"), status_code=400)
 
     conn.execute("UPDATE users SET last_login = ? WHERE id = ?", (now_text(), row["id"]))
     conn.commit()
     conn.close()
 
+    clear_login_failures(request)
     token = create_session(int(row["id"]))
     response = RedirectResponse("/", status_code=303)
     set_auth_cookie(response, token)
@@ -1531,11 +1673,12 @@ def api_sync_runs(user: Dict[str, object] = Depends(require_user)):
     conn = get_conn()
     rows = conn.execute(
         """
-        SELECT id, source_url, keyword, used_proxy, used_cookie, status,
-               total_found, inserted_count, updated_count, restored_from_available,
-               started_at, finished_at, error_message
-        FROM sync_runs
-        ORDER BY id DESC
+        SELECT r.id, r.source_id, COALESCE(s.name, r.source_url) AS source_name, r.source_url, r.keyword, r.used_proxy, r.used_cookie, r.status,
+               r.total_found, r.inserted_count, r.updated_count, r.restored_from_available,
+               r.started_at, r.finished_at, r.error_message
+        FROM sync_runs r
+        LEFT JOIN source_configs s ON s.id = r.source_id
+        ORDER BY r.id DESC
         LIMIT 100
         """
     ).fetchall()
@@ -1598,8 +1741,18 @@ def create_source(payload: SourceConfigPayload, user: Dict[str, object] = Depend
             )
             VALUES(?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?)
         """, (name, source_url, default_keyword, request_cookie, schedule_enabled, schedule_interval_minutes, enabled, sort_order, now_text(), now_text()))
-        conn.commit()
         new_id = int(cur.lastrowid)
+        conn.execute(
+            """
+            UPDATE asset_records
+            SET source_id=?
+            WHERE source_id IS NULL
+              AND source_url=?
+              AND (keyword=? OR ?='')
+            """,
+            (new_id, source_url, default_keyword, default_keyword),
+        )
+        conn.commit()
     except sqlite3.IntegrityError:
         conn.close()
         return JSONResponse({"success": False, "message": "该数据源名称已存在，请换一个名称或点击更新"}, status_code=400)
@@ -1633,6 +1786,16 @@ def update_source(source_id: int, payload: SourceConfigPayload, user: Dict[str, 
                 updated_at=?
             WHERE id=?
         """, (name, source_url, default_keyword, request_cookie, schedule_enabled, schedule_interval_minutes, enabled, sort_order, now_text(), source_id))
+        conn.execute(
+            """
+            UPDATE asset_records
+            SET source_id=?
+            WHERE (source_id IS NULL OR source_id=?)
+              AND source_url=?
+              AND (keyword=? OR ?='')
+            """,
+            (source_id, source_id, source_url, default_keyword, default_keyword),
+        )
         conn.commit()
         changed = cur.rowcount
     except sqlite3.IntegrityError:
@@ -1713,10 +1876,29 @@ def get_records(user: Dict[str, object] = Depends(require_user)):
     auto_purify_expired_countdowns("get_records")
     conn = get_conn()
     rows = conn.execute("""
-        SELECT id, content_text, status_timer, last_checked, source_url, keyword,
-               status_type, remaining_hours, raw_status, expire_at
-        FROM asset_records
-        ORDER BY last_checked DESC, id DESC
+        SELECT
+            a.id,
+            a.source_id,
+            COALESCE(a.source_id, s.id) AS effective_source_id,
+            COALESCE(s.name, a.source_url) AS source_name,
+            a.content_text,
+            a.status_timer,
+            a.last_checked,
+            a.source_url,
+            a.keyword,
+            a.status_type,
+            a.remaining_hours,
+            a.raw_status,
+            a.expire_at
+        FROM asset_records a
+        LEFT JOIN source_configs s
+          ON s.id = a.source_id
+          OR (
+              a.source_id IS NULL
+              AND s.source_url = a.source_url
+              AND (s.default_keyword = a.keyword OR s.default_keyword = '' OR a.keyword = '')
+          )
+        ORDER BY a.last_checked DESC, a.id DESC
     """).fetchall()
     conn.close()
     return {"data": [dict(row) for row in rows]}
@@ -1742,15 +1924,33 @@ def classify_record_status(status_text: str, status_type: str = "") -> str:
 @app.get("/api/export_records")
 def export_records(
     source_url: str = "all",
+    source_id: str = "all",
     status_filter: str = "all",
     q: str = "",
     user: Dict[str, object] = Depends(require_user),
 ):
     conn = get_conn()
     rows = conn.execute("""
-        SELECT id, content_text, status_timer, last_checked, source_url, keyword, status_type
-        FROM asset_records
-        ORDER BY last_checked DESC, id DESC
+        SELECT
+            a.id,
+            a.source_id,
+            COALESCE(a.source_id, s.id) AS effective_source_id,
+            COALESCE(s.name, a.source_url) AS source_name,
+            a.content_text,
+            a.status_timer,
+            a.last_checked,
+            a.source_url,
+            a.keyword,
+            a.status_type
+        FROM asset_records a
+        LEFT JOIN source_configs s
+          ON s.id = a.source_id
+          OR (
+              a.source_id IS NULL
+              AND s.source_url = a.source_url
+              AND (s.default_keyword = a.keyword OR s.default_keyword = '' OR a.keyword = '')
+          )
+        ORDER BY a.last_checked DESC, a.id DESC
     """).fetchall()
     conn.close()
 
@@ -1761,12 +1961,19 @@ def export_records(
         item = dict(row)
         status_class = classify_record_status(item.get("status_timer") or "", item.get("status_type") or "")
 
-        if source_url != "all" and item.get("source_url") != source_url:
+        if source_id != "all":
+            try:
+                if int(item.get("effective_source_id") or 0) != int(source_id):
+                    continue
+            except Exception:
+                continue
+        elif source_url != "all" and item.get("source_url") != source_url:
             continue
+
         if status_filter != "all" and status_class != status_filter:
             continue
         if q:
-            haystack = f"{item.get('content_text') or ''} {item.get('keyword') or ''}".lower()
+            haystack = f"{item.get('content_text') or ''} {item.get('keyword') or ''} {item.get('source_name') or ''}".lower()
             if q not in haystack:
                 continue
 
@@ -1774,7 +1981,7 @@ def export_records(
 
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["ID", "地址内容", "状态", "最后更新", "数据源", "关键词"])
+    writer.writerow(["ID", "地址内容", "状态", "最后更新", "数据源名称", "数据源网址", "关键词"])
 
     for item in data:
         writer.writerow([
@@ -1782,6 +1989,7 @@ def export_records(
             item.get("content_text", ""),
             item.get("status_timer", ""),
             item.get("last_checked", ""),
+            item.get("source_name", ""),
             item.get("source_url", ""),
             item.get("keyword", ""),
         ])
@@ -1929,6 +2137,11 @@ async def api_merge_upload_backup(file: UploadFile = File(...), user: Dict[str, 
     with tempfile.TemporaryDirectory() as tmp:
         tmp_file = Path(tmp) / Path(file.filename).name
         content = await file.read()
+        if len(content) > MAX_BACKUP_UPLOAD_BYTES:
+            return JSONResponse(
+                {"success": False, "message": f"备份包不能超过 {MAX_BACKUP_UPLOAD_BYTES // 1024 // 1024} MB"},
+                status_code=413,
+            )
         tmp_file.write_bytes(content)
 
         try:
@@ -2020,6 +2233,67 @@ button{width:100%;height:48px;margin-top:22px;border:0;border-radius:10px;backgr
 .switch a{color:#1677ff;font-weight:800;text-decoration:none}
 .error{margin:18px 32px 0;padding:12px 14px;border-radius:10px;background:#fff1f0;border:1px solid #ffccc7;color:#a8071a}
 .hint{margin-top:14px;padding:12px;border-radius:10px;background:#f8fafc;color:#64748b;font-size:13px;line-height:1.7}
+
+
+/* v4 mobile asset-first layout */
+.mobile-header{display:none}
+.mobile-menu-btn{border:0;background:#1677ff;color:#fff;border-radius:12px;height:42px;min-width:42px;padding:0 12px;font-weight:900;font-size:18px;cursor:pointer}
+.mobile-overlay{display:none}
+.mobile-only{display:none}
+
+@media(max-width:768px){
+  .app{display:block}
+  .mobile-header{display:flex;align-items:center;justify-content:space-between;gap:10px;background:#fff;border-bottom:1px solid var(--line);padding:10px 12px;position:sticky;top:0;z-index:30}
+  .mobile-header .mh-title{font-weight:900;font-size:17px;color:#101828;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .mobile-header .mh-sub{font-size:12px;color:#667085;margin-top:2px}
+  .mobile-only{display:block}
+  .mobile-overlay{position:fixed;inset:0;background:rgba(15,23,42,.45);z-index:40;display:none}
+  body.drawer-open .mobile-overlay{display:block}
+  .sidebar{position:fixed;left:0;top:0;bottom:0;width:min(82vw,320px);height:100vh;z-index:50;transform:translateX(-105%);transition:transform .22s ease;overflow:auto;border-radius:0 18px 18px 0;box-shadow:16px 0 38px rgba(15,23,42,.22)}
+  body.drawer-open .sidebar{transform:translateX(0)}
+  .brand{padding:10px 4px 18px}
+  .nav{display:grid;grid-template-columns:1fr;gap:8px;overflow:visible;padding:0;margin:0}
+  .nav button{width:100%;height:46px;text-align:left;padding:0 14px;border-radius:12px;min-width:0}
+  .user{margin-top:18px}
+  .topbar{display:none}
+  .content{padding:12px}
+  .stats{display:none}
+  #statusMsg{display:none}
+  .panel-head{margin-bottom:10px}
+  #tab-assets .panel-head h2{font-size:17px}
+  #tab-assets .panel-head .actions{grid-template-columns:1fr 1fr;width:100%;margin-top:8px}
+  .asset-tools{grid-template-columns:1fr;gap:8px;margin-bottom:10px}
+  .asset-tools input{display:none}
+  .asset-tools button{display:none}
+  #sourceFilter{height:48px;font-weight:800;background:#fff;border-radius:14px}
+  .source-summary{grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px;background:#fff}
+  .source-summary strong{grid-column:1/-1;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .source-summary .mini{font-size:12px;padding:7px 6px}
+  .status-tabs{grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-bottom:10px}
+  .status-tabs button{height:36px;border-radius:12px;font-size:12px;padding:0 4px}
+  .status-tabs button span{display:block;font-size:11px;font-weight:900;margin-top:1px}
+  .advanced{display:none}
+  #addressList{gap:8px}
+  .record{padding:10px 11px;border-radius:13px;box-shadow:0 4px 14px rgba(15,23,42,.04)}
+  .record-select{align-items:center;gap:8px}
+  .record-select input{width:17px;min-height:17px;margin-top:0}
+  .record-head{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:center;gap:8px;width:100%}
+  .addr{font-size:15px;line-height:1.45;font-weight:900;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-all}
+  .badge{font-size:12px;padding:5px 8px;border-radius:999px;white-space:nowrap}
+  .record .meta{display:none}
+  .record .mobile-meta{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px;color:#667085;font-size:11px;line-height:1.4}
+  .record .mobile-meta span{background:#f8fafc;border:1px solid #eef2f7;border-radius:999px;padding:3px 7px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .pagination{position:sticky;bottom:0;background:rgba(245,247,251,.97);padding:9px 0;margin-top:10px}
+  .pagination .btn{min-width:72px;height:38px}
+  #pageInfo{font-size:12px;white-space:nowrap;color:#667085}
+}
+
+@media(max-width:380px){
+  .status-tabs{grid-template-columns:repeat(2,minmax(0,1fr))}
+  #tab-assets .panel-head .actions{grid-template-columns:1fr}
+  .source-summary{grid-template-columns:1fr 1fr}
+}
+
 </style>
 </head>
 <body>
@@ -2038,7 +2312,7 @@ __ERROR__
 __CONFIRM__
 <button type="submit">__BUTTON__</button>
 <div class="switch"><a href="__SWITCH_URL__">__SWITCH_TEXT__</a></div>
-<div class="hint">测试环境建议关闭注册。当前可通过 REGISTRATION_ENABLED 控制注册开关。</div>
+
 </form>
 </section>
 </body>
@@ -2148,6 +2422,13 @@ input:focus,select:focus,textarea:focus{border-color:#1677ff;box-shadow:0 0 0 3p
 .logbox{max-height:300px;overflow:auto;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;line-height:1.7}
 details.clean{border:1px solid var(--line);border-radius:12px;padding:12px;background:#fff}
 details.clean summary{cursor:pointer;font-weight:900;color:#344054}
+.source-summary{display:grid;grid-template-columns:1.4fr repeat(4,auto);gap:10px;align-items:center;margin-bottom:12px;padding:12px;border:1px solid var(--line);border-radius:12px;background:#f8fafc;color:#344054}
+.source-summary strong{font-size:14px;color:#101828}
+.source-summary .mini{display:inline-flex;gap:6px;align-items:center;border:1px solid var(--line);background:white;border-radius:999px;padding:6px 10px;font-size:12px;font-weight:800;white-space:nowrap}
+.record-select{display:flex;align-items:flex-start;gap:10px;width:100%}
+.record-select input{width:18px;min-height:18px;margin-top:5px;flex:0 0 auto}
+.record-body{min-width:0;flex:1}
+.record .source-label{font-weight:800;color:#475467}
 @media(max-width:1100px){
 .app{grid-template-columns:1fr}
 .sidebar{position:relative;height:auto}
@@ -2174,11 +2455,266 @@ details.clean summary{cursor:pointer;font-weight:900;color:#344054}
 .badge{margin-top:8px}
 .meta,.item-meta{display:grid}
 }
+/* v3 mobile responsive hotfix: prevent horizontal overflow on all phones */
+html,body{width:100%;max-width:100%;overflow-x:hidden}
+.app,.main,.content,.panel,.card,.topbar,.sidebar{min-width:0;max-width:100%}
+input,select,textarea,button{max-width:100%;min-width:0}
+*{min-width:0}
+
+@media(max-width:768px){
+  body{background:#f5f7fb}
+  .app{display:block;width:100%;overflow-x:hidden}
+  .sidebar{position:relative;height:auto;width:100%;padding:14px 14px 16px;border-radius:0;overflow:hidden}
+  .brand{padding:0 0 12px;align-items:center}
+  .logo{width:44px;height:44px;border-radius:12px;flex:0 0 auto}
+  .brand b{font-size:17px;line-height:1.3}
+  .brand span{font-size:13px}
+  .nav{display:flex;gap:8px;overflow-x:auto;padding:4px 0 8px;margin:0 -2px;scroll-snap-type:x proximity;-webkit-overflow-scrolling:touch}
+  .nav::-webkit-scrollbar{display:none}
+  .nav button{flex:0 0 auto;width:auto;min-width:96px;height:40px;text-align:center;padding:0 14px;border-radius:12px;white-space:nowrap;scroll-snap-align:start}
+  .user{position:static;margin-top:10px;padding:10px;border-radius:12px}
+  .user-name{font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .user form{margin:8px 0 0}
+  .user button{height:38px;margin-top:0}
+
+  .topbar{position:relative;height:auto;display:block;padding:16px 16px 12px;border-bottom:1px solid var(--line)}
+  .topbar h1{font-size:22px;line-height:1.25;margin-bottom:6px}
+  .topbar .desc,#dbInfo{display:block;font-size:12px;line-height:1.6;white-space:normal;word-break:break-word}
+  .content{padding:12px;width:100%;overflow:hidden}
+
+  .stats{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-bottom:12px}
+  .stat{padding:14px 16px;border-radius:14px}
+  .stat span{font-size:13px;line-height:1.4}
+  .stat strong{font-size:24px;line-height:1.2;margin-top:8px}
+
+  .panel{padding:14px;border-radius:14px;margin-bottom:12px;overflow:hidden}
+  .panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+  .panel-head h2{font-size:18px;line-height:1.3}
+  .actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;width:100%;margin-top:4px}
+  .btn{height:42px;width:100%;padding:0 10px;border-radius:12px;font-size:14px;white-space:nowrap}
+
+  .quick-grid,.asset-tools,.advanced-box,.form-grid{display:grid;grid-template-columns:1fr;gap:10px;width:100%}
+  .source-layout{display:block;width:100%}
+  .source-list,.history-list,.backup-list,.list{gap:10px;width:100%}
+  .item,.record{padding:12px;border-radius:14px;width:100%;overflow:hidden}
+  .item-head,.record-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px;flex-wrap:wrap}
+  .item-title,.addr{font-size:15px;line-height:1.55;word-break:break-all;overflow-wrap:anywhere}
+  .item-meta,.meta{display:flex;flex-wrap:wrap;gap:6px 10px;font-size:12px;line-height:1.55;word-break:break-word;overflow-wrap:anywhere}
+  .badge{margin-top:0;flex:0 0 auto}
+
+  .source-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:10px;border-radius:14px;overflow:hidden}
+  .source-summary strong{grid-column:1/-1;font-size:14px;line-height:1.5;word-break:break-word;overflow-wrap:anywhere}
+  .source-summary .mini{justify-content:center;width:100%;padding:7px 8px;white-space:normal;text-align:center;border-radius:12px}
+
+  .status-tabs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;width:100%}
+  .status-tabs button{height:38px;width:100%;padding:0 8px;white-space:nowrap}
+
+  select,input{height:44px;font-size:16px;border-radius:12px}
+  textarea{font-size:14px;border-radius:12px}
+  .pagination{position:sticky;bottom:0;z-index:4;background:rgba(245,247,251,.96);backdrop-filter:blur(8px);padding:10px 0;margin:10px -4px 0;gap:8px}
+  .pagination .btn{width:auto;min-width:82px}
+  .empty{padding:20px 12px;border-radius:14px}
+}
+
+@media(max-width:390px){
+  .content{padding:10px}
+  .sidebar{padding:12px}
+  .stats{grid-template-columns:1fr}
+  .actions{grid-template-columns:1fr}
+  .source-summary{grid-template-columns:1fr}
+  .status-tabs{grid-template-columns:1fr 1fr}
+  .nav button{min-width:88px;padding:0 12px}
+}
+
+
+
+/* v5/v6 mobile asset-only cleanup: real drawer + minimal asset list */
+@media(max-width:768px){
+  html,body{width:100%;max-width:100%;overflow-x:hidden;background:#f5f7fb}
+  .mobile-header{display:flex!important;position:sticky;top:0;z-index:60;height:54px;align-items:center;gap:10px;background:#fff;border-bottom:1px solid var(--line);padding:8px 12px;box-shadow:0 2px 10px rgba(15,23,42,.04)}
+  .mobile-menu-btn{display:inline-grid;place-items:center;width:38px;height:38px;min-width:38px;padding:0;border-radius:12px;border:0;background:#1677ff;color:#fff;font-size:18px;font-weight:900}
+  .mobile-header .mh-title{font-size:17px;line-height:1.1;font-weight:900;color:#101828}
+  .mobile-header .mh-sub{display:none}
+  .mobile-overlay{position:fixed!important;inset:0;background:rgba(15,23,42,.48);z-index:70;display:none!important}
+  body.drawer-open .mobile-overlay{display:block!important}
+  .app{display:block!important;width:100%!important;min-height:auto!important;overflow-x:hidden!important}
+  .sidebar{position:fixed!important;top:0!important;left:0!important;bottom:0!important;width:min(82vw,300px)!important;height:100dvh!important;z-index:80!important;transform:translateX(-105%)!important;transition:transform .22s ease!important;border-radius:0 18px 18px 0!important;box-shadow:16px 0 38px rgba(15,23,42,.28)!important;padding:14px!important;overflow:auto!important;background:#101828!important}
+  body.drawer-open .sidebar{transform:translateX(0)!important}
+  .sidebar .mobile-only{display:block!important;width:100%;height:42px;margin:0 0 14px!important;border-radius:14px;background:#fff;color:#101828}
+  .brand{padding:0 0 14px!important}
+  .nav{display:grid!important;grid-template-columns:1fr!important;gap:8px!important;overflow:visible!important;margin:0!important;padding:0!important}
+  .nav button{width:100%!important;min-width:0!important;height:44px!important;text-align:left!important;padding:0 14px!important;border-radius:12px!important}
+  .user{position:static!important;margin-top:16px!important}
+  .main{width:100%!important;min-width:0!important}
+  .topbar,.stats,#statusMsg{display:none!important}
+  .content{padding:10px!important;width:100%!important;overflow:hidden!important}
+  .panel{box-shadow:none!important;border:0!important;background:transparent!important;padding:0!important;margin:0!important;border-radius:0!important}
+  #tab-assets .panel-head{display:none!important}
+  .asset-tools{display:block!important;margin:0 0 10px!important;width:100%!important}
+  .asset-tools input,.asset-tools button{display:none!important}
+  #sourceFilter{display:block!important;width:100%!important;height:48px!important;border-radius:14px!important;border:1px solid #d0d5dd!important;background:#fff!important;padding:0 12px!important;font-size:15px!important;font-weight:800!important;color:#101828!important;box-shadow:0 4px 14px rgba(15,23,42,.04)!important}
+  #sourceSummary{display:none!important}
+  .status-tabs{display:grid!important;grid-template-columns:repeat(2,minmax(0,1fr))!important;gap:8px!important;margin:0 0 10px!important}
+  .status-tabs button{height:38px!important;border-radius:999px!important;background:#fff!important;border:1px solid #e5e7eb!important;font-size:14px!important;font-weight:900!important;padding:0 8px!important}
+  .status-tabs button.active{border-color:#1677ff!important;background:#eaf3ff!important;color:#0958d9!important}
+  .status-tabs button span{display:inline!important;margin-left:4px!important}
+  .advanced{display:none!important}
+  #addressList{display:grid!important;gap:8px!important;margin:0!important;padding:0!important}
+  .record{list-style:none!important;background:#fff!important;border:1px solid #e5e7eb!important;border-radius:14px!important;padding:10px 12px!important;box-shadow:0 4px 14px rgba(15,23,42,.04)!important}
+  .record-select{display:block!important}
+  .record-check{display:none!important}
+  .record-body{width:100%!important}
+  .record-head{display:grid!important;grid-template-columns:minmax(0,1fr) auto!important;align-items:center!important;gap:8px!important;width:100%!important}
+  .addr{font-size:15px!important;line-height:1.45!important;font-weight:900!important;color:#101828!important;word-break:break-all!important;overflow-wrap:anywhere!important;display:-webkit-box!important;-webkit-line-clamp:2!important;-webkit-box-orient:vertical!important;overflow:hidden!important}
+  .badge{font-size:13px!important;line-height:1!important;padding:6px 9px!important;border-radius:999px!important;white-space:nowrap!important;font-weight:900!important}
+  .record .meta,.record .mobile-meta{display:none!important}
+  .pagination{position:sticky!important;bottom:0!important;z-index:20!important;background:rgba(245,247,251,.96)!important;backdrop-filter:blur(8px)!important;display:grid!important;grid-template-columns:78px 1fr 78px!important;align-items:center!important;gap:8px!important;margin:8px -10px 0!important;padding:9px 10px!important;border-top:1px solid #e5e7eb!important}
+  .pagination .btn{height:38px!important;width:100%!important;min-width:0!important;border-radius:12px!important}
+  #pageInfo{text-align:center!important;font-size:12px!important;color:#667085!important;white-space:nowrap!important}
+}
+
+@media(max-width:360px){
+  .status-tabs{grid-template-columns:1fr 1fr!important}
+  .addr{font-size:14px!important}
+}
+
+
+
+
+/* v6 desktop restore + mobile asset copy polish */
+.copy-btn{border:1px solid #d0d5dd;background:#fff;color:#1677ff;border-radius:999px;height:30px;padding:0 10px;font-weight:900;cursor:pointer;white-space:nowrap;box-shadow:0 2px 8px rgba(15,23,42,.04)}
+.copy-btn:hover{border-color:#1677ff;background:#eef6ff}
+.addr-row{display:flex;align-items:flex-start;gap:8px;min-width:0;flex:1}
+@media(min-width:769px){
+  .mobile-header,.mobile-overlay,.mobile-only{display:none!important}
+  .app{display:grid!important;grid-template-columns:220px minmax(0,1fr)!important;min-height:100vh!important}
+  .sidebar{position:sticky!important;top:0!important;height:100vh!important;width:auto!important;transform:none!important;border-radius:0!important;box-shadow:none!important;overflow:auto!important;background:#101828!important;padding:18px!important}
+  .main{display:block!important;min-width:0!important;width:100%!important;background:var(--bg)!important}
+  .content{padding:20px!important;display:block!important}
+  .topbar{display:flex!important}
+  .stats{display:grid!important}
+  .panel{display:block!important;background:var(--card)!important;border:1px solid var(--line)!important;border-radius:14px!important;padding:16px!important;box-shadow:var(--shadow)!important;margin-bottom:14px!important}
+  #tab-assets .panel-head{display:flex!important}
+  .asset-tools{display:grid!important;grid-template-columns:1.2fr 1fr auto!important;gap:10px!important;margin-bottom:12px!important}
+  .asset-tools input,.asset-tools button{display:block!important}
+  .status-tabs{display:flex!important;gap:8px!important;flex-wrap:wrap!important}
+  .advanced{display:block!important}
+  .record .meta{display:flex!important}
+  .record-check{display:block!important}
+}
+@media(max-width:768px){
+  body{background:#f1f5f9!important}
+  .mobile-header{border-radius:0 0 16px 16px!important}
+  .content{padding:8px!important}
+  .asset-tools{margin-top:2px!important}
+  #sourceFilter{height:44px!important;border-radius:12px!important;font-size:14px!important;box-shadow:0 2px 8px rgba(15,23,42,.04)!important}
+  .status-tabs{grid-template-columns:repeat(4,minmax(0,1fr))!important;gap:6px!important;margin-bottom:8px!important}
+  .status-tabs button{height:34px!important;font-size:12px!important;padding:0 4px!important}
+  .record{padding:9px 10px!important;border-radius:12px!important;margin:0!important}
+  .record-head{grid-template-columns:minmax(0,1fr) auto auto!important;gap:6px!important}
+  .addr{font-size:14px!important;line-height:1.4!important;-webkit-line-clamp:2!important}
+  .badge{font-size:12px!important;padding:5px 8px!important}
+  .copy-btn{height:28px!important;padding:0 9px!important;font-size:12px!important;background:#f8fafc!important}
+  .pagination{margin:8px -8px 0!important;padding:8px!important}
+}
+@media(max-width:390px){
+  .status-tabs{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+}
+
+
+/* v7 layout polish: true phone-only mobile mode, restored desktop UI */
+@media (min-width:641px){
+  .mobile-header,.mobile-overlay,.mobile-only{display:none!important}
+  body{background:#f5f7fb!important;overflow-x:hidden!important}
+  .app{display:grid!important;grid-template-columns:248px minmax(0,1fr)!important;min-height:100vh!important;width:100%!important;overflow:visible!important}
+  .sidebar{position:sticky!important;top:0!important;height:100vh!important;width:248px!important;transform:none!important;border-radius:0!important;box-shadow:none!important;overflow:auto!important;background:#101828!important;padding:20px 18px!important}
+  .brand{padding:4px 4px 22px!important}
+  .brand b{font-size:16px!important}
+  .nav{display:grid!important;grid-template-columns:1fr!important;gap:8px!important;overflow:visible!important;margin:0!important;padding:0!important}
+  .nav button{width:100%!important;height:44px!important;min-width:0!important;border-radius:12px!important;text-align:left!important;padding:0 14px!important}
+  .user{position:absolute!important;left:18px!important;right:18px!important;bottom:18px!important;margin:0!important;background:#1d2939!important}
+  .main{min-width:0!important;width:100%!important;background:#f5f7fb!important;display:block!important}
+  .topbar{display:flex!important;height:68px!important;background:#fff!important;border-bottom:1px solid #e5e7eb!important;padding:0 26px!important}
+  .stats{display:grid!important;grid-template-columns:repeat(4,minmax(0,1fr))!important;gap:14px!important;margin-bottom:16px!important}
+  .content{padding:22px 26px!important;display:block!important;max-width:100%!important;overflow:visible!important}
+  .panel{display:block!important;background:#fff!important;border:1px solid #e5e7eb!important;border-radius:18px!important;padding:18px!important;box-shadow:0 12px 28px rgba(15,23,42,.05)!important;margin-bottom:16px!important}
+  #tab-assets .panel-head{display:flex!important;margin-bottom:16px!important}
+  .asset-tools{display:grid!important;grid-template-columns:minmax(260px,1fr) minmax(360px,.85fr) 76px!important;gap:12px!important;align-items:center!important;margin-bottom:14px!important}
+  .asset-tools input,.asset-tools select{height:46px!important;border-radius:14px!important;font-size:15px!important}
+  .asset-tools button{display:block!important;height:46px!important;border-radius:14px!important}
+  .source-summary{display:flex!important;align-items:center!important;gap:10px!important;flex-wrap:wrap!important;margin-bottom:14px!important;padding:12px 14px!important;border:1px solid #e8eef6!important;border-radius:16px!important;background:#f8fafc!important}
+  .source-summary strong{margin-right:auto!important;font-size:15px!important;color:#101828!important;min-width:220px!important}
+  .source-summary .mini{border-radius:999px!important;background:#fff!important;border:1px solid #e5e7eb!important;padding:7px 12px!important;font-size:13px!important}
+  .status-tabs{display:flex!important;gap:10px!important;flex-wrap:wrap!important;margin:0 0 12px!important}
+  .status-tabs button{height:38px!important;border-radius:999px!important;padding:0 18px!important;font-size:14px!important;background:#fff!important;border:1px solid #e5e7eb!important}
+  .status-tabs button.active{background:#eef6ff!important;border-color:#1677ff!important;color:#0958d9!important;box-shadow:0 0 0 3px rgba(22,119,255,.08)!important}
+  .advanced{display:block!important;margin-bottom:12px!important}
+  .advanced-box{display:grid!important;grid-template-columns:220px 140px auto auto!important;gap:10px!important;align-items:center!important;background:#f8fafc!important;border:1px solid #edf2f7!important;border-radius:14px!important;padding:12px!important;margin-top:10px!important}
+  .list{display:grid!important;gap:10px!important;margin:0!important;padding:0!important}
+  .record{background:#fff!important;border:1px solid #e7edf5!important;border-radius:16px!important;padding:14px 16px!important;box-shadow:0 6px 18px rgba(15,23,42,.035)!important;transition:box-shadow .16s ease,transform .16s ease,border-color .16s ease!important}
+  .record:hover{border-color:#cbd5e1!important;box-shadow:0 12px 28px rgba(15,23,42,.07)!important;transform:translateY(-1px)!important}
+  .record-select{display:grid!important;grid-template-columns:26px minmax(0,1fr)!important;gap:12px!important;align-items:start!important;width:100%!important}
+  .record-check{display:block!important;width:18px!important;height:18px!important;margin-top:4px!important}
+  .record-body{min-width:0!important;width:100%!important}
+  .record-head{display:grid!important;grid-template-columns:minmax(0,1fr) auto auto!important;gap:10px!important;align-items:start!important;width:100%!important}
+  .addr{font-size:16px!important;line-height:1.55!important;font-weight:900!important;color:#0f172a!important;word-break:break-word!important;overflow-wrap:anywhere!important}
+  .copy-btn{height:32px!important;padding:0 13px!important;border-radius:999px!important;background:#f8fafc!important;color:#1677ff!important;border:1px solid #d7e3f3!important;justify-self:end!important}
+  .badge{height:30px!important;display:inline-flex!important;align-items:center!important;border-radius:999px!important;padding:0 12px!important;font-weight:900!important;white-space:nowrap!important}
+  .meta{display:flex!important;flex-wrap:wrap!important;gap:8px 16px!important;margin-top:8px!important;color:#667085!important;font-size:12px!important;line-height:1.6!important}
+  .mobile-meta{display:none!important}
+  .pagination{display:flex!important;justify-content:center!important;align-items:center!important;gap:14px!important;margin-top:16px!important;padding-top:12px!important;border-top:1px solid #eef2f7!important;position:static!important;background:transparent!important}
+  .pagination .btn{width:auto!important;min-width:92px!important;height:40px!important;border-radius:12px!important}
+}
+@media (max-width:640px){
+  html,body{width:100%!important;max-width:100%!important;overflow-x:hidden!important;background:#eef2f7!important}
+  .mobile-header{display:flex!important;position:sticky!important;top:0!important;z-index:60!important;height:52px!important;align-items:center!important;gap:10px!important;background:#ffffff!important;border-bottom:1px solid #e5e7eb!important;padding:8px 10px!important;box-shadow:0 2px 10px rgba(15,23,42,.04)!important}
+  .mobile-menu-btn{width:38px!important;height:38px!important;border-radius:12px!important;background:#1677ff!important;color:#fff!important;border:0!important;font-weight:900!important}
+  .mobile-header .mh-title{font-size:16px!important;font-weight:900!important;color:#101828!important}
+  .mobile-header .mh-sub{display:none!important}
+  .app{display:block!important;width:100%!important;min-height:auto!important;overflow:hidden!important}
+  .sidebar{position:fixed!important;top:0!important;left:0!important;bottom:0!important;width:min(78vw,286px)!important;height:100dvh!important;z-index:80!important;transform:translateX(-105%)!important;transition:transform .2s ease!important;border-radius:0 18px 18px 0!important;background:#101828!important;box-shadow:16px 0 40px rgba(15,23,42,.25)!important;padding:14px!important;overflow:auto!important}
+  body.drawer-open .sidebar{transform:translateX(0)!important}
+  .mobile-overlay{position:fixed!important;inset:0!important;background:rgba(15,23,42,.48)!important;z-index:70!important;display:none!important}
+  body.drawer-open .mobile-overlay{display:block!important}
+  .sidebar .mobile-only{display:block!important;width:100%!important;height:42px!important;margin:0 0 14px!important;border-radius:14px!important;background:#fff!important;color:#101828!important}
+  .topbar,.stats,#statusMsg,#tab-assets .panel-head,#sourceSummary,.advanced{display:none!important}
+  .main{width:100%!important;min-width:0!important;background:#eef2f7!important}
+  .content{padding:8px!important;width:100%!important;overflow:hidden!important}
+  .panel{border:0!important;background:transparent!important;padding:0!important;margin:0!important;box-shadow:none!important;border-radius:0!important}
+  .asset-tools{display:block!important;margin:0 0 8px!important;width:100%!important}
+  .asset-tools input,.asset-tools button{display:none!important}
+  #sourceFilter{display:block!important;width:100%!important;height:44px!important;border-radius:12px!important;border:1px solid #d8e0eb!important;background:#fff!important;padding:0 10px!important;font-size:14px!important;font-weight:800!important;color:#101828!important;box-shadow:0 2px 9px rgba(15,23,42,.04)!important}
+  .status-tabs{display:grid!important;grid-template-columns:repeat(4,minmax(0,1fr))!important;gap:5px!important;margin:0 0 8px!important}
+  .status-tabs button{height:32px!important;border-radius:999px!important;background:#fff!important;border:1px solid #e2e8f0!important;font-size:12px!important;font-weight:900!important;padding:0 3px!important;white-space:nowrap!important}
+  .status-tabs button.active{border-color:#1677ff!important;background:#eaf3ff!important;color:#0958d9!important}
+  .status-tabs button span{display:inline!important;margin-left:2px!important}
+  #addressList{display:grid!important;gap:7px!important;margin:0!important;padding:0!important}
+  .record{background:#fff!important;border:1px solid #e5e7eb!important;border-radius:12px!important;padding:9px 10px!important;box-shadow:0 3px 10px rgba(15,23,42,.035)!important}
+  .record-select{display:block!important;width:100%!important}
+  .record-check{display:none!important}
+  .record-body{width:100%!important;min-width:0!important}
+  .record-head{display:grid!important;grid-template-columns:minmax(0,1fr) auto auto!important;gap:6px!important;align-items:center!important;width:100%!important}
+  .addr{font-size:14px!important;line-height:1.4!important;font-weight:900!important;color:#101828!important;word-break:break-word!important;overflow-wrap:anywhere!important;display:-webkit-box!important;-webkit-line-clamp:2!important;-webkit-box-orient:vertical!important;overflow:hidden!important}
+  .copy-btn{height:28px!important;padding:0 8px!important;font-size:12px!important;border-radius:999px!important;background:#f8fafc!important;color:#1677ff!important;border:1px solid #d7e3f3!important}
+  .badge{height:26px!important;font-size:12px!important;display:inline-flex!important;align-items:center!important;padding:0 8px!important;border-radius:999px!important;white-space:nowrap!important;font-weight:900!important}
+  .record .meta,.record .mobile-meta{display:none!important}
+  .pagination{position:sticky!important;bottom:0!important;z-index:20!important;background:rgba(238,242,247,.96)!important;backdrop-filter:blur(8px)!important;display:grid!important;grid-template-columns:78px 1fr 78px!important;align-items:center!important;gap:8px!important;margin:8px -8px 0!important;padding:8px!important;border-top:1px solid #e2e8f0!important}
+  .pagination .btn{height:38px!important;width:100%!important;min-width:0!important;border-radius:12px!important;background:#fff!important}
+  #pageInfo{text-align:center!important;font-size:12px!important;color:#667085!important;white-space:nowrap!important}
+}
+@media (max-width:380px){
+  .status-tabs{grid-template-columns:repeat(2,minmax(0,1fr))!important}
+}
 </style>
 </head>
 <body>
+<div class="mobile-header"><button class="mobile-menu-btn" onclick="openDrawer()" aria-label="打开菜单">☰</button><div><div class="mh-title" id="mobilePageTitle">资产看板</div><div class="mh-sub" id="mobileSubTitle">只显示地址和状态，更多功能在菜单里</div></div></div>
+<div class="mobile-overlay" onclick="closeDrawer()"></div>
 <div class="app">
+
+
 <aside class="sidebar">
+<button class="mobile-only btn" style="margin-bottom:12px" onclick="closeDrawer()">关闭菜单</button>
 <div class="brand">
 <div class="logo">资</div>
 <div><b>资产智能管控台</b><span>管理后台</span></div>
@@ -2259,11 +2795,12 @@ details.clean summary{cursor:pointer;font-weight:900;color:#344054}
 <button class="btn" onclick="renderList(true)">查询</button>
 </div>
 
+<div id="sourceSummary" class="source-summary"></div>
 <div class="status-tabs">
-<button id="statusBtn_all" class="active" onclick="setStatusFilter('all')">全部</button>
-<button id="statusBtn_safe" onclick="setStatusFilter('safe')">纯净可用</button>
-<button id="statusBtn_danger" onclick="setStatusFilter('danger')">风控中</button>
-<button id="statusBtn_unknown" onclick="setStatusFilter('unknown')">未知</button>
+<button id="statusBtn_all" class="active" onclick="setStatusFilter('all')">全部 <span id="tabCount_all">0</span></button>
+<button id="statusBtn_safe" onclick="setStatusFilter('safe')">纯净可用 <span id="tabCount_safe">0</span></button>
+<button id="statusBtn_danger" onclick="setStatusFilter('danger')">风控中 <span id="tabCount_danger">0</span></button>
+<button id="statusBtn_unknown" onclick="setStatusFilter('unknown')">未知 <span id="tabCount_unknown">0</span></button>
 </div>
 
 <details class="advanced">
@@ -2281,7 +2818,7 @@ details.clean summary{cursor:pointer;font-weight:900;color:#344054}
 <option value="100">100/页</option>
 </select>
 <button class="btn" onclick="exportCurrentCsv()">导出当前结果</button>
-<button class="btn danger" onclick="deleteCurrentFilteredRecords()">删除当前结果</button>
+<button class="btn danger" onclick="deleteSelectedRecords()">删除勾选记录</button>
 </div>
 </details>
 
@@ -2452,6 +2989,9 @@ function updateClock() {
     $("clockText").innerText = "本地时间 " + new Date().toLocaleString();
 }
 
+function openDrawer(){ document.body.classList.add("drawer-open"); }
+function closeDrawer(){ document.body.classList.remove("drawer-open"); }
+
 function showTab(name) {
     document.querySelectorAll(".tab").forEach(x => x.classList.remove("active"));
     document.querySelectorAll(".nav button").forEach(x => x.classList.remove("active"));
@@ -2461,6 +3001,8 @@ function showTab(name) {
 
     const titles = {home:"首页", assets:"资产看板", sources:"数据源管理", backup:"备份恢复", system:"系统维护"};
     $("pageTitle").innerText = titles[name] || "资产智能管控台";
+    if ($("mobilePageTitle")) $("mobilePageTitle").innerText = titles[name] || "资产智能管控台";
+    closeDrawer();
 }
 
 async function apiFetch(url, opt = {}) {
@@ -2589,6 +3131,44 @@ function newSource() {
     msg("已切换到新建数据源模式。", "");
 }
 
+
+function splitSourceName(name) {
+    name = String(name || "未命名数据源").trim();
+    const parts = name.split("|").map(x => x.trim()).filter(Boolean);
+    if (parts.length >= 2) return {group: parts[0], item: parts.slice(1).join("|")};
+    return {group: name, item: name};
+}
+
+function sourceDisplayName(s) {
+    if (!s) return "当前数据源";
+    const parts = splitSourceName(s.name || "未命名数据源");
+    if (parts.group && parts.item && parts.group !== parts.item) return `${parts.group}｜${parts.item}`;
+    return parts.item || parts.group || "未命名数据源";
+}
+
+function appendGroupedSourceOptions(selectEl, firstLabel, firstValue, mode) {
+    selectEl.innerHTML = "";
+    if (firstLabel !== null) selectEl.appendChild(new Option(firstLabel, firstValue));
+    const groups = new Map();
+    sources.forEach(s => {
+        const parts = splitSourceName(s.name);
+        const key = parts.group || "其他";
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push({source: s, item: parts.item});
+    });
+    Array.from(groups.entries()).sort((a,b) => a[0].localeCompare(b[0], "zh-CN")).forEach(([groupName, rows]) => {
+        const optgroup = document.createElement("optgroup");
+        optgroup.label = groupName;
+        rows.sort((a,b) => String(a.item).localeCompare(String(b.item), "zh-CN"));
+        rows.forEach(({source:s}) => {
+            let label = sourceDisplayName(s);
+            if (!s.enabled) label += " [停用]";
+            optgroup.appendChild(new Option(label, String(s.id)));
+        });
+        selectEl.appendChild(optgroup);
+    });
+}
+
 async function loadSources() {
     try {
         const r = await apiFetch("/api/sources");
@@ -2599,28 +3179,16 @@ async function loadSources() {
 
         const old = $("sourceSelect").value;
         const oldQuick = $("quickSourceSelect").value;
+        const oldFilter = $("sourceFilter").value;
 
-        $("sourceSelect").innerHTML = "";
-        $("quickSourceSelect").innerHTML = "";
-        $("sourceFilter").innerHTML = "";
-
-        $("sourceSelect").appendChild(new Option("手动输入或新建数据源", ""));
-        $("quickSourceSelect").appendChild(new Option("请选择数据源", ""));
-        $("sourceFilter").appendChild(new Option("全部数据源", "all"));
+        appendGroupedSourceOptions($("sourceSelect"), "手动输入或新建数据源", "", "edit");
+        appendGroupedSourceOptions($("quickSourceSelect"), "请选择数据源", "", "quick");
+        appendGroupedSourceOptions($("sourceFilter"), "全部数据源", "all", "filter");
 
         const list = $("sourceList");
         list.innerHTML = "";
 
         sources.forEach(s => {
-            let label = (s.enabled ? "" : "[停用] ") + s.name;
-            if (s.default_keyword) label += " / " + s.default_keyword;
-            if (s.request_cookie) label += " / Cookie";
-            if (s.schedule_enabled) label += " / 定时";
-
-            $("sourceSelect").appendChild(new Option(label, String(s.id)));
-            $("quickSourceSelect").appendChild(new Option(label, String(s.id)));
-            $("sourceFilter").appendChild(new Option(s.name + " - " + s.source_url, s.source_url));
-
             const item = document.createElement("div");
             item.className = "item";
             item.innerHTML = `
@@ -2649,6 +3217,9 @@ async function loadSources() {
 
         if (sources.some(s => String(s.id) === oldQuick)) {
             $("quickSourceSelect").value = oldQuick;
+        }
+        if (oldFilter === "all" || sources.some(s => String(s.id) === oldFilter)) {
+            $("sourceFilter").value = oldFilter;
         }
     } catch (e) {
         msg("加载数据源失败。", "bad");
@@ -2872,19 +3443,81 @@ function setStatusFilter(v) {
     renderList(true);
 }
 
-function filteredData() {
+function recordSourceId(x) {
+    return String(x.effective_source_id || x.source_id || "");
+}
+
+function sourceById(id) {
+    id = String(id || "");
+    return sources.find(s => String(s.id) === id) || null;
+}
+
+function formatRecordSourceName(name) {
+    const parts = splitSourceName(name);
+    if (parts.group && parts.item && parts.group !== parts.item) return `${parts.group}｜${parts.item}`;
+    return parts.item || parts.group || name || "-";
+}
+
+function recordMatchesSelectedSource(x, selected) {
+    if (!selected || selected === "all") return true;
+    if (recordSourceId(x) === selected) return true;
+    const s = sourceById(selected);
+    return !!(s && !recordSourceId(x) && x.source_url === s.source_url);
+}
+
+function sourceScopedData() {
     const source = $("sourceFilter").value;
     const q = $("assetSearch").value.trim().toLowerCase();
-    const sort = $("sortFilter").value;
-
-    let arr = globalData.filter(x => {
-        const s = cls(x.status_timer, x.status_type);
-        if (source !== "all" && x.source_url !== source) return false;
-        if (currentStatus !== "all" && s !== currentStatus) return false;
+    return globalData.filter(x => {
+        if (!recordMatchesSelectedSource(x, source)) return false;
         if (q) {
-            const text = `${x.content_text || ""} ${x.keyword || ""}`.toLowerCase();
+            const text = `${x.content_text || ""} ${x.keyword || ""} ${x.source_name || ""} ${x.source_url || ""}`.toLowerCase();
             if (!text.includes(q)) return false;
         }
+        return true;
+    });
+}
+
+function countByStatus(rows) {
+    const out = {all: rows.length, safe: 0, danger: 0, unknown: 0};
+    rows.forEach(x => { out[cls(x.status_timer, x.status_type)]++; });
+    return out;
+}
+
+function updateLocalCounters(scopedRows, visibleRows) {
+    const c = countByStatus(scopedRows);
+    const selected = $("sourceFilter").value;
+    const selectedSource = sourceById(selected);
+    const title = selected === "all" ? "全部数据源" : (selectedSource ? sourceDisplayName(selectedSource) : "当前数据源");
+
+    $("tabCount_all").textContent = c.all;
+    $("tabCount_safe").textContent = c.safe;
+    $("tabCount_danger").textContent = c.danger;
+    $("tabCount_unknown").textContent = c.unknown;
+
+    $("totalCount").textContent = visibleRows.length;
+    $("safeCount").textContent = visibleRows.filter(x => cls(x.status_timer, x.status_type) === "safe").length;
+    $("dangerCount").textContent = visibleRows.filter(x => cls(x.status_timer, x.status_type) === "danger").length;
+
+    const box = $("sourceSummary");
+    if (box) {
+        box.innerHTML = `
+            <strong>${escapeHtml(title)} 的当前统计</strong>
+            <span class="mini">全部 ${c.all}</span>
+            <span class="mini safe">纯净 ${c.safe}</span>
+            <span class="mini danger">风控 ${c.danger}</span>
+            <span class="mini unknown">未知 ${c.unknown}</span>
+        `;
+    }
+}
+
+function filteredData() {
+    const sort = $("sortFilter").value;
+    const scoped = sourceScopedData();
+
+    let arr = scoped.filter(x => {
+        const s = cls(x.status_timer, x.status_type);
+        if (currentStatus !== "all" && s !== currentStatus) return false;
         return true;
     });
 
@@ -2892,7 +3525,33 @@ function filteredData() {
     else if (sort === "longest") arr.sort((a,b) => parseTimeValue(b.status_timer) - parseTimeValue(a.status_timer));
     else arr.sort((a,b) => new Date((b.last_checked || "").replace(" ","T")) - new Date((a.last_checked || "").replace(" ","T")));
 
+    updateLocalCounters(scoped, arr);
     return arr;
+}
+
+
+
+async function copyAddress(text) {
+    const value = String(text || "").trim();
+    if (!value) return;
+    try {
+        if (navigator.clipboard && window.isSecureContext) {
+            await navigator.clipboard.writeText(value);
+        } else {
+            const ta = document.createElement("textarea");
+            ta.value = value;
+            ta.style.position = "fixed";
+            ta.style.left = "-9999px";
+            document.body.appendChild(ta);
+            ta.focus();
+            ta.select();
+            document.execCommand("copy");
+            ta.remove();
+        }
+        msg("地址已复制", "ok");
+    } catch (e) {
+        msg("复制失败，请长按地址手动复制", "bad");
+    }
 }
 
 function renderList(reset = false) {
@@ -2919,20 +3578,34 @@ function renderList(reset = false) {
         const li = document.createElement("li");
         li.className = "record";
         li.innerHTML = `
-            <div class="record-head">
-                <div class="addr">📍 ${escapeHtml(x.content_text || "")}</div>
-                <span class="badge ${s}">${s === "safe" ? "纯净可用" : s === "danger" ? "风控中" : "未知"}</span>
-            </div>
-            <div class="meta">
-                <span>状态：${escapeHtml(x.status_timer || "未知状态")}</span>
-                <span>关键词：${escapeHtml(x.keyword || "-")}</span>
-                <span>更新：${escapeHtml(x.last_checked || "-")}</span>
-                <span>来源：${escapeHtml(x.source_url || "-")}</span>
+            <div class="record-select">
+                <input type="checkbox" class="record-check" value="${Number(x.id)}" aria-label="选择这条记录">
+                <div class="record-body">
+                    <div class="record-head">
+                        <div class="addr">${escapeHtml(x.content_text || "")}</div>
+                        <button type="button" class="copy-btn">复制</button>
+                        <span class="badge ${s}">${s === "safe" ? "纯净" : s === "danger" ? "风控" : "未知"}</span>
+                    </div>
+                    <div class="mobile-meta">
+                        <span>${escapeHtml(formatRecordSourceName(x.source_name || "当前分类"))}</span>
+                        <span>${escapeHtml(x.status_timer || "未知状态")}</span>
+                    </div>
+                    <div class="meta">
+                        <span>状态：${escapeHtml(x.status_timer || "未知状态")}</span>
+                        <span>关键词：${escapeHtml(x.keyword || "-")}</span>
+                        <span>更新：${escapeHtml(x.last_checked || "-")}</span>
+                        <span class="source-label">分类：${escapeHtml(formatRecordSourceName(x.source_name || "-"))}</span>
+                        <span>当前网址：${escapeHtml(x.source_url || "-")}</span>
+                    </div>
+                </div>
             </div>
         `;
+        const copyBtn = li.querySelector(".copy-btn");
+        if (copyBtn) copyBtn.addEventListener("click", () => copyAddress(x.content_text || ""));
         $("addressList").appendChild(li);
     });
 }
+
 
 function showEmpty(text) {
     $("addressList").innerHTML = `<li class="empty">${escapeHtml(text)}</li>`;
@@ -2945,20 +3618,26 @@ function changePage(d) {
 
 function exportCurrentCsv() {
     const params = new URLSearchParams();
-    params.set("source_url", $("sourceFilter").value || "all");
+    params.set("source_id", $("sourceFilter").value || "all");
     params.set("status_filter", currentStatus || "all");
     params.set("q", $("assetSearch").value.trim() || "");
     window.location.href = "/api/export_records?" + params.toString();
 }
 
-async function deleteCurrentFilteredRecords() {
-    const arr = filteredData();
-    if (!arr.length) {
-        msg("当前筛选没有可删除的记录。", "warn");
+function selectedRecordIds() {
+    return Array.from(document.querySelectorAll(".record-check:checked"))
+        .map(x => parseInt(x.value))
+        .filter(x => Number.isInteger(x) && x > 0);
+}
+
+async function deleteSelectedRecords() {
+    const ids = selectedRecordIds();
+    if (!ids.length) {
+        msg("请先勾选要删除的具体记录。不会再按当前网址一键全删。", "warn");
         return;
     }
 
-    const confirmText = prompt(`危险操作：将删除当前筛选结果中的 ${arr.length} 条资产记录。\n请输入 DELETE 确认：`);
+    const confirmText = prompt(`将只删除你勾选的 ${ids.length} 条记录。\n请输入 DELETE 确认：`);
     if (confirmText !== "DELETE") {
         msg("已取消删除。", "warn");
         return;
@@ -2968,7 +3647,7 @@ async function deleteCurrentFilteredRecords() {
         const r = await apiFetch("/api/records/bulk_delete", {
             method: "POST",
             headers: {"Content-Type": "application/json"},
-            body: JSON.stringify({ids: arr.map(x => x.id)}),
+            body: JSON.stringify({ids}),
         });
         if (!r) return;
         const j = await r.json();
@@ -2979,6 +3658,7 @@ async function deleteCurrentFilteredRecords() {
         msg("删除失败。", "bad");
     }
 }
+
 
 async function fetchSyncRuns() {
     try {

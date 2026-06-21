@@ -1,0 +1,13 @@
+asset_management.db
+*.db
+*.sqlite
+*.sqlite3
+.env
+.git
+__pycache__/
+*.pyc
+backups/
+export_backups/
+data/
+logs/
+*.log
